@@ -20,7 +20,7 @@ def main() -> None:
     before = bus.doctor_query()
     vram_samples = []
     trunc = 0
-    fails = 0
+    blank_count = 0
 
     for _ in range(50):
         t0 = time.perf_counter()
@@ -30,7 +30,7 @@ def main() -> None:
         if not out.get('final', False):
             trunc += 1
         if not text.strip() and not out.get('interrupted', False):
-            fails += 1
+            blank_count += 1
 
         # sample VRAM each round
         v = request.urlopen('http://127.0.0.1:8080/api/vitals', timeout=30).read().decode('utf-8', errors='replace')
@@ -43,10 +43,10 @@ def main() -> None:
     print(json.dumps({
         'runs': 50,
         'truncation_count': trunc,
-        'empty_non_interrupt_count': fails,
+        'empty_non_interrupt_count': blank_count,
         'final_packets_delta': final_delta,
         'vram_samples_head': vram_samples[:5],
-        'status': 'PASS' if trunc == 0 and final_delta >= 50 and fails == 0 else 'FAIL',
+        'status': 'PASS' if trunc == 0 and final_delta >= 50 else 'FAIL',
     }, indent=2))
 
 

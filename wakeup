@@ -84,7 +84,7 @@ rm -f "$EVENT_BUS_PATH" 2>/dev/null || true
 sleep 1
 
 # Action 0: boot event-bus before model handshake
-"$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/event_bus.py" --daemon >"$EVENT_BUS_LOG" 2>&1 &
+nohup "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/event_bus.py" --daemon >"$EVENT_BUS_LOG" 2>&1 &
 EVENT_BUS_PID=$!
 echo "$EVENT_BUS_PID" > "$EVENT_BUS_PID_FILE"
 
@@ -102,7 +102,7 @@ if [[ ! -S "$EVENT_BUS_PATH" ]]; then
 fi
 
 # Action 1: boot llama-server
-"$LLAMA_SERVER_BIN" \
+nohup "$LLAMA_SERVER_BIN" \
     --model "$MODEL_REQ" \
     --port 8081 \
     --n-gpu-layers 99 \
@@ -134,7 +134,7 @@ if [[ "$ready" -ne 1 ]]; then
 fi
 
 # Action 3: launch gator bridge API/CLI wrapper
-GATOR_DEBUG="$GATOR_DEBUG" "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/gator_bridge.py" \
+nohup env GATOR_DEBUG="$GATOR_DEBUG" "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/gator_bridge.py" \
     --mode api \
     --server "http://127.0.0.1:8081" \
     --host "127.0.0.1" \
@@ -151,7 +151,7 @@ for _ in $(seq 1 60); do
 done
 
 # Action 4: launch web UI on localhost:8080
-GATOR_DEBUG="$GATOR_DEBUG" "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/interfaces/webui.py" \
+nohup env GATOR_DEBUG="$GATOR_DEBUG" "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/interfaces/webui.py" \
     --host "127.0.0.1" \
     --port 8080 \
     >"$WEBUI_LOG" 2>&1 &
