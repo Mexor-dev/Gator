@@ -6,9 +6,16 @@ MODEL_REQ="$GATOR_ROOT/models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 MODEL_ALT="$GATOR_ROOT/models/chassis.gguf"
 SERVER_LOG="$GATOR_ROOT/logs/llama_server.log"
 BRIDGE_LOG="$GATOR_ROOT/logs/gator_bridge.log"
+WEBUI_LOG="$GATOR_ROOT/logs/webui.log"
 PID_DIR="$GATOR_ROOT/bin"
+EVENT_BUS_PATH="/tmp/gator_event.bus"
+EVENT_BUS_LOG="$GATOR_ROOT/logs/event_bus.log"
+EVENT_BUS_PID_FILE="$PID_DIR/event_bus.pid"
 SERVER_PID_FILE="$PID_DIR/llama_server.pid"
 BRIDGE_PID_FILE="$PID_DIR/gator_bridge.pid"
+WEBUI_PID_FILE="$PID_DIR/webui.pid"
+GATOR_DEBUG="${GATOR_DEBUG:-false}"
+GATOR_DAEMON="${GATOR_DAEMON:-false}"
 
 mkdir -p "$GATOR_ROOT/logs" "$PID_DIR"
 
@@ -50,24 +57,54 @@ if [[ -z "$LLAMA_SERVER_BIN" ]]; then
 fi
 
 cleanup() {
+    if [[ -f "$EVENT_BUS_PID_FILE" ]]; then
+        kill "$(cat "$EVENT_BUS_PID_FILE")" 2>/dev/null || true
+    fi
     if [[ -f "$BRIDGE_PID_FILE" ]]; then
         kill "$(cat "$BRIDGE_PID_FILE")" 2>/dev/null || true
+    fi
+    if [[ -f "$WEBUI_PID_FILE" ]]; then
+        kill "$(cat "$WEBUI_PID_FILE")" 2>/dev/null || true
     fi
     if [[ -f "$SERVER_PID_FILE" ]]; then
         kill "$(cat "$SERVER_PID_FILE")" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT INT TERM
+if [[ "$GATOR_DAEMON" != "true" ]]; then
+    trap cleanup EXIT INT TERM
+fi
 
 # Clear stale instances so the new stack binds expected ports and code version.
 pkill -f "/home/user/Gator/src/gator_bridge.py" 2>/dev/null || true
 pkill -f "llama-server.*--port 8080" 2>/dev/null || true
+pkill -f "llama-server.*--port 8081" 2>/dev/null || true
+pkill -f "/home/user/Gator/src/interfaces/webui.py" 2>/dev/null || true
+pkill -f "/home/user/Gator/src/event_bus.py --daemon" 2>/dev/null || true
+rm -f "$EVENT_BUS_PATH" 2>/dev/null || true
 sleep 1
+
+# Action 0: boot event-bus before model handshake
+"$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/event_bus.py" --daemon >"$EVENT_BUS_LOG" 2>&1 &
+EVENT_BUS_PID=$!
+echo "$EVENT_BUS_PID" > "$EVENT_BUS_PID_FILE"
+
+for _ in $(seq 1 40); do
+    if [[ -S "$EVENT_BUS_PATH" ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+if [[ ! -S "$EVENT_BUS_PATH" ]]; then
+    echo "[FATAL] event bus did not become ready at $EVENT_BUS_PATH"
+    tail -n 40 "$EVENT_BUS_LOG" || true
+    exit 1
+fi
 
 # Action 1: boot llama-server
 "$LLAMA_SERVER_BIN" \
     --model "$MODEL_REQ" \
-    --port 8080 \
+    --port 8081 \
     --n-gpu-layers 99 \
     --ctx-size 8192 \
     --pooling mean \
@@ -83,7 +120,7 @@ for _ in $(seq 1 120); do
         ready=1
         break
     fi
-    if curl -sSf "http://127.0.0.1:8080/health" >/dev/null 2>&1; then
+    if curl -sSf "http://127.0.0.1:8081/health" >/dev/null 2>&1; then
         ready=1
         break
     fi
@@ -97,9 +134,9 @@ if [[ "$ready" -ne 1 ]]; then
 fi
 
 # Action 3: launch gator bridge API/CLI wrapper
-"$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/gator_bridge.py" \
+GATOR_DEBUG="$GATOR_DEBUG" "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/gator_bridge.py" \
     --mode api \
-    --server "http://127.0.0.1:8080" \
+    --server "http://127.0.0.1:8081" \
     --host "127.0.0.1" \
     --port 8090 \
     >"$BRIDGE_LOG" 2>&1 &
@@ -113,9 +150,31 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 
+# Action 4: launch web UI on localhost:8080
+GATOR_DEBUG="$GATOR_DEBUG" "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/interfaces/webui.py" \
+    --host "127.0.0.1" \
+    --port 8080 \
+    >"$WEBUI_LOG" 2>&1 &
+WEBUI_PID=$!
+echo "$WEBUI_PID" > "$WEBUI_PID_FILE"
+
+for _ in $(seq 1 60); do
+    if curl -sSf "http://127.0.0.1:8080/api/health" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
 echo "GATOR IS AWAKE. VRAM CONSTRAINTS NOMINAL. LOGIC GRAFT ACTIVE."
 echo "llama-server pid: $SERVER_PID"
 echo "gator-bridge pid: $BRIDGE_PID"
-echo "logs: $SERVER_LOG | $BRIDGE_LOG"
+echo "webui pid: $WEBUI_PID"
+echo "event-bus pid: $EVENT_BUS_PID"
+echo "debug: GATOR_DEBUG=$GATOR_DEBUG"
+echo "logs: $EVENT_BUS_LOG | $SERVER_LOG | $BRIDGE_LOG | $WEBUI_LOG"
+
+if [[ "$GATOR_DAEMON" == "true" ]]; then
+    exit 0
+fi
 
 wait "$BRIDGE_PID"

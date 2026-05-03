@@ -45,7 +45,7 @@ class SkillBuildResult:
 
 
 class SkillArchitect:
-    def __init__(self, server_url: str = "http://127.0.0.1:8080") -> None:
+    def __init__(self, server_url: str = "http://127.0.0.1:8081") -> None:
         self.mem = GatorMemoryCore(server_url=server_url)
         self.db = lancedb.connect(str(GATOR_ROOT / "db"))
         TOOLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -184,7 +184,7 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description="Gator Architect skill creator")
     parser.add_argument("--skill-name", required=True)
     parser.add_argument("--spec", required=True)
-    parser.add_argument("--server", default="http://127.0.0.1:8080")
+    parser.add_argument("--server", default="http://127.0.0.1:8081")
     args = parser.parse_args()
 
     arch = SkillArchitect(server_url=args.server)

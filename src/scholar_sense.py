@@ -28,8 +28,9 @@ GATOR_ROOT = Path.home() / "Gator"
 RESEARCH_ROOT = GATOR_ROOT / "research"
 GRAPH_OUT = RESEARCH_ROOT / "graphify-out"
 TABLE_NAME = "scholar_memory"
-DEFAULT_SERVER = "http://127.0.0.1:8080"
+DEFAULT_SERVER = "http://127.0.0.1:8081"
 GRAPHIFY_BIN = Path.home() / ".local" / "bin" / "graphify"
+SIMILARITY_FLOOR = 0.25
 
 
 class ScholarSenseError(RuntimeError):
@@ -240,6 +241,39 @@ class ScholarSense:
         # Pull a broader candidate pool, then apply Vector Pivot filtering in Python.
         candidates = table.search(np.asarray(qvec, dtype=np.float32).tolist()).limit(max(top_k * 5, 20)).to_list()
 
+        if not candidates:
+            return {
+                "question": question,
+                "god_nodes": god_nodes,
+                "selected_chunks": [],
+                "token_cap": token_cap,
+                "estimated_tokens_used": 0,
+                "context": "",
+                "strategy": "graphify_god_nodes -> lancedb_vector_pivot",
+                "zero_context": True,
+                "floor": SIMILARITY_FLOOR,
+                "best_similarity": 0.0,
+                "reason": "NO_CANDIDATES",
+            }
+
+        # LanceDB returns distance; map to a bounded similarity score.
+        best_dist = float(candidates[0].get("_distance", 1e9) or 1e9)
+        best_similarity = 1.0 / (1.0 + max(0.0, best_dist))
+        if best_similarity < SIMILARITY_FLOOR:
+            return {
+                "question": question,
+                "god_nodes": god_nodes,
+                "selected_chunks": [],
+                "token_cap": token_cap,
+                "estimated_tokens_used": 0,
+                "context": "",
+                "strategy": "graphify_god_nodes -> lancedb_vector_pivot",
+                "zero_context": True,
+                "floor": SIMILARITY_FLOOR,
+                "best_similarity": round(best_similarity, 4),
+                "reason": "SIMILARITY_FLOOR",
+            }
+
         filtered: list[dict[str, Any]] = []
         god_set = set(god_nodes)
         for row in candidates:
@@ -278,6 +312,9 @@ class ScholarSense:
             "estimated_tokens_used": used_tokens,
             "context": "\n\n".join(context_parts),
             "strategy": "graphify_god_nodes -> lancedb_vector_pivot",
+            "zero_context": False,
+            "floor": SIMILARITY_FLOOR,
+            "best_similarity": round(best_similarity, 4),
         }
 
 

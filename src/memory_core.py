@@ -25,7 +25,7 @@ import pyarrow as pa
 GATOR_ROOT = Path.home() / "Gator"
 DB_ROOT = GATOR_ROOT / "db"
 TABLE_NAME = "gator_memory"
-DEFAULT_SERVER = "http://127.0.0.1:8080"
+DEFAULT_SERVER = "http://127.0.0.1:8081"
 
 
 class MemoryCoreError(RuntimeError):

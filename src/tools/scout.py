@@ -136,7 +136,7 @@ async def _scrape(url: str, timeout_sec: int = 35) -> tuple[str, str, int | None
             pass
 
 
-def scout_url(url: str, server: str = "http://127.0.0.1:8080") -> ScoutResult:
+def scout_url(url: str, server: str = "http://127.0.0.1:8081") -> ScoutResult:
     started = time.time()
     title, text, browser_pid = asyncio.run(_scrape(url))
     if not text:
@@ -160,7 +160,7 @@ def scout_url(url: str, server: str = "http://127.0.0.1:8080") -> ScoutResult:
 def _main() -> None:
     parser = argparse.ArgumentParser(description="Gator Scout CDP scraper")
     parser.add_argument("--url", required=True, help="Target URL")
-    parser.add_argument("--server", default="http://127.0.0.1:8080", help="llama-server URL")
+    parser.add_argument("--server", default="http://127.0.0.1:8081", help="llama-server URL")
     args = parser.parse_args()
 
     out = scout_url(args.url, server=args.server)

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import lancedb
+from event_bus import EventBusClient
 
 GATOR_ROOT = Path.home() / "Gator"
 STATE_FILE = GATOR_ROOT / "bin" / "maintenance_state.json"
@@ -38,6 +39,7 @@ class GatorMaintenance:
     def __init__(self, root: Path = GATOR_ROOT) -> None:
         self.root = root
         self.db = lancedb.connect(str(root / "db"))
+        self.bus = EventBusClient()
         (self.root / "bin").mkdir(parents=True, exist_ok=True)
 
     def init_git_mirror(self) -> dict[str, Any]:
@@ -89,6 +91,7 @@ class GatorMaintenance:
         return data
 
     def run_dream_cycle(self, idle_minutes: int = 30) -> dict[str, Any]:
+        self.snapshot_state("immune pre-dream snapshot")
         data = self._load_state()
         now = time.time()
         idle_for = (now - float(data.get("last_activity_ts", now))) / 60.0
@@ -135,6 +138,26 @@ class GatorMaintenance:
             "graph_updated": graph_updated,
         }
 
+    def doctor_query(self) -> dict[str, Any]:
+        return self.bus.doctor_query()
+
+    def test_restart_attach(self) -> dict[str, Any]:
+        # Simulate crash + autonomous restart and require recovery within 5 seconds.
+        _run(["bash", "-lc", "pkill -f '/home/user/Gator/src/gator_bridge.py' 2>/dev/null || true"], check=False)
+        t0 = time.perf_counter()
+        _run(["bash", "-lc", "GATOR_DAEMON=true bash /home/user/Gator/wakeup"], check=False)
+
+        ok = False
+        for _ in range(25):
+            probe = _run(["bash", "-lc", "curl -s http://127.0.0.1:8090/health"], check=False)
+            if '"ok":true' in (probe.stdout or ""):
+                ok = True
+                break
+            time.sleep(0.2)
+
+        elapsed = time.perf_counter() - t0
+        return {"recovered": ok, "seconds": round(elapsed, 3), "target_max_seconds": 5.0}
+
     def execute_with_rollback(self, command: list[str]) -> dict[str, Any]:
         snap = self.snapshot_state("immune pre-change snapshot")
         proc = _run(command, cwd=self.root, check=False)
@@ -158,6 +181,8 @@ def _main() -> None:
     parser.add_argument("--dream", action="store_true")
     parser.add_argument("--idle-minutes", type=int, default=30)
     parser.add_argument("--test-rollback", action="store_true")
+    parser.add_argument("--doctor-query", action="store_true")
+    parser.add_argument("--test-restart", action="store_true")
     args = parser.parse_args()
 
     m = GatorMaintenance()
@@ -174,6 +199,10 @@ def _main() -> None:
         bad_script.write_text("#!/bin/bash\necho 'mock failure' 1>&2\nexit 42\n", encoding="utf-8")
         os.chmod(bad_script, 0o755)
         out["rollback_test"] = m.execute_with_rollback(["bash", str(bad_script)])
+    if args.doctor_query:
+        out["doctor_query"] = m.doctor_query()
+    if args.test_restart:
+        out["restart_test"] = m.test_restart_attach()
 
     if not out:
         parser.error("Provide at least one action flag")

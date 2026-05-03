@@ -11,6 +11,7 @@ import argparse
 import gzip
 import json
 import math
+import os
 import pickle
 import re
 import time
@@ -24,10 +25,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
+from event_bus import EventBusClient, EventBusError
+
 GATOR_ROOT = Path.home() / "Gator"
 GATE_PATH = GATOR_ROOT / "bin" / "logic_map.gate"
-DEFAULT_SERVER = "http://127.0.0.1:8080"
+DEFAULT_SERVER = "http://127.0.0.1:8081"
 BIAS_WEIGHT = 0.4
+DEBUG_ENABLED = os.environ.get("GATOR_DEBUG", "false").lower() == "true"
+DEBUG_FILE = GATOR_ROOT / "logs" / "debug.json"
 
 CATEGORY_TAGS = {
     "chain_of_thought": 0,
@@ -59,6 +64,14 @@ class GatorBridge:
         self.server_url = server_url.rstrip("/")
         self.gate_path = gate_path
         self.gate = self._load_gate(gate_path)
+        self.bus = EventBusClient()
+
+    def _emit_debug(self, payload: dict[str, Any]) -> None:
+        if not DEBUG_ENABLED:
+            return
+        DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with DEBUG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
     def _post_json(self, url: str, payload: dict[str, Any], timeout: float = 60.0) -> dict[str, Any]:
         req = request.Request(
@@ -163,8 +176,22 @@ class GatorBridge:
 
         generated = ""
         biases_applied_total = 0
+        step_meta: list[dict[str, Any]] = []
+        interrupted = False
+
+        try:
+            self.bus.publish({"type": "generation_start", "prompt_preview": prompt[:120], "final": False})
+        except Exception:
+            pass
 
         for step_idx in range(max_tokens):
+            try:
+                if self.bus.consume_interrupt().get("interrupt", False):
+                    interrupted = True
+                    break
+            except Exception:
+                pass
+
             running_prompt = f"{prompt}{generated}"
             traj_tokens = self._tokenize(running_prompt)
             needs_bias = self._trajectory_needs_bias(traj_tokens, pathway)
@@ -179,6 +206,8 @@ class GatorBridge:
                 selected = pathway[:64]
                 logit_bias = {str(tok): BIAS_WEIGHT for tok in selected}
                 biases_applied_total += len(selected)
+            else:
+                selected = []
 
             payload = {
                 "prompt": running_prompt,
@@ -197,8 +226,56 @@ class GatorBridge:
                 break
 
             generated += piece
+            step_meta.append(
+                {
+                    "step": step_idx,
+                    "needs_bias": needs_bias,
+                    "bias_count": len(selected),
+                    "traj_tokens": len(traj_tokens),
+                    "piece": piece,
+                }
+            )
+            try:
+                self.bus.publish(
+                    {
+                        "type": "token_step",
+                        "step": step_idx,
+                        "piece": piece,
+                        "bias_count": len(selected),
+                        "final": False,
+                    }
+                )
+            except Exception:
+                pass
             if data.get("stop", False):
                 break
+
+        final_packet = {
+            "type": "generation_final",
+            "final": True,
+            "interrupted": interrupted,
+            "text_len": len(generated),
+            "biases_applied_total": biases_applied_total,
+            "category": INV_TAGS.get(cat, str(cat)),
+        }
+        try:
+            final_ack = self.bus.publish(final_packet)
+            if not final_ack.get("ok", False):
+                raise BridgeError("Event-bus rejected final packet")
+        except EventBusError as exc:
+            raise BridgeError(f"Event-bus final handshake failed: {exc}") from exc
+
+        self._emit_debug(
+            {
+                "ts": time.time(),
+                "prompt_preview": prompt[:240],
+                "category": INV_TAGS.get(cat, str(cat)),
+                "bias_weight": BIAS_WEIGHT,
+                "biases_applied_total": biases_applied_total,
+                "selected_pathway_preview": pathway[:12],
+                "steps": step_meta,
+            }
+        )
 
         return {
             "text": generated,
@@ -206,6 +283,8 @@ class GatorBridge:
             "bias_weight": BIAS_WEIGHT,
             "biases_applied_total": biases_applied_total,
             "logic_records_loaded": self.gate.total_records,
+            "interrupted": interrupted,
+            "final": True,
         }
 
 

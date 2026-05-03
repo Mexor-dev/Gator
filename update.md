@@ -2,6 +2,115 @@
 
 ---
 
+## PHASE 6: Vitals & Surgical UI
+**Date:** 2026-05-03  
+**Status:** PASS
+
+### Build Summary
+- Added `src/pulse_check.py` for live vitals checks:
+  - PID liveness (`llama_server`, `gator_bridge`, `webui`)
+  - bridge health probe
+  - canary query to verify logic graft remains active (`biases_applied_total > 0`)
+  - TPS estimate + VRAM snapshot
+- Added `GATOR_DEBUG=true` support:
+  - `wakeup` propagates env to bridge
+  - `gator_bridge.py` writes high-fidelity per-step logit decisions to `logs/debug.json`.
+- Added Surgical Lab UI in `src/interfaces/webui.py` (Hermes-inspired vanilla FastAPI + JS):
+  - Hosted on `localhost:8080`
+  - Live vitals widget from `/api/vitals`
+  - Graph map embedded from `research/graphify-out/graph.html`
+  - Debug decision tail from `/api/debug_tail`
+- Runtime topology finalized:
+  - `llama-server` moved to `127.0.0.1:8081`
+  - `gator_bridge` stays on `127.0.0.1:8090`
+  - WebUI on `127.0.0.1:8080`
+
+### Validation Results
+- `/scan` equivalent executed via Telegram interface simulation (`tg_bot.py --simulate-scan`) and returned `status=PASS`.
+- WebUI checks:
+  - `GET /api/health` -> `{"ok":true}`
+  - `GET /api/vitals` -> PASS payload with live TPS/VRAM/PIDs
+- Debug logging checks:
+  - `logs/debug.json` contains step-by-step donor bias events (`bias_count=64`, pathway preview).
+- VRAM: `~2173 MiB / 6144 MiB` (within 6GB ceiling).
+
+### Files Added/Updated
+- Added: `src/pulse_check.py`
+- Added: `src/interfaces/webui.py`
+- Updated: `src/gator_bridge.py` (debug trace logging)
+- Updated: `wakeup` (debug toggle + webui startup + daemon mode)
+- Updated: defaults in memory/scholar/scout/skills to llama `:8081`
+
+---
+
+## PHASE 5: Immune System (Circadian Maintenance)
+**Date:** 2026-05-03  
+**Status:** PASS
+
+### Build Summary
+- Added `src/maintenance.py`:
+  - Hidden Git mirror bootstrap in `~/Gator/.git`
+  - Autonomous snapshot commits (`src`, `config`, `wakeup`, `update.md`)
+  - Idle dream cycle (`>30m`, test forced with `--idle-minutes 0`):
+    - prunes redundant `scholar_memory` vectors
+    - refreshes Graphify map
+  - Rollback logic: executes task, and on failure performs `git reset --hard HEAD` to return to last stable snapshot.
+
+### Validation Results
+- Snapshot test:
+  - Commit created successfully (`head=ed52e11` during phase test)
+- Dream cycle test (`--dream --idle-minutes 0`):
+  - `dream_ran=true`
+  - `vectors_pruned=3`
+  - `graph_updated=true`
+- Rollback test (`--test-rollback`):
+  - Forced script failure with exit code `42`
+  - Auto-rollback executed (`rolled_back=true`)
+  - Stable head restored (`b3902d5` at test time)
+
+### Files Added
+- `src/maintenance.py`
+
+---
+
+## PHASE 4: Ambient Senses (Voice & Pocket UI)
+**Date:** 2026-05-03  
+**Status:** PASS (local simulation)
+
+### Build Summary
+- Installed CPU-only voice stack in venv:
+  - STT: `faster-whisper` (CPU `int8`)
+  - TTS: `piper-tts` (local ONNX voice model)
+  - Telegram: `python-telegram-bot`
+- Added `src/interfaces/voice_layer.py`:
+  - Local Piper model bootstrap/download
+  - WAV synthesis
+  - CPU Whisper transcription
+- Added `src/interfaces/tg_bot.py` (OpenClaw-style hook, recoded natively):
+  - Text query handling
+  - Voice-note flow: decode -> STT -> bridge query -> TTS reply audio
+  - System commands: `/scan`, `/wakeup`
+  - Local test hooks: `--simulate-voice`, `--simulate-scan`
+
+### Validation Results
+- Local voice-note roundtrip simulation:
+  - Input: `run scan and summarize stability`
+  - Transcribed: `Runs can and summarise stability.`
+  - Bridge response returned and synthesized to WAV:
+    - `logs/phase4_out_1777811225.wav`
+- `/scan` simulation through bot path triggers pulse check and returns PASS JSON.
+- VRAM remained within budget during voice + bridge execution (`~2170-2175 MiB / 6144 MiB`).
+
+### Donor Access Note
+- Direct `OpenClaw` repository clone requested GitHub credentials in this environment.
+- Implemented donor-compatible Telegram architecture natively (minimal dependency footprint) and validated end-to-end locally.
+
+### Files Added
+- `src/interfaces/voice_layer.py`
+- `src/interfaces/tg_bot.py`
+
+---
+
 ## PHASE 3: The Hands (Scout & Architect)
 **Date:** 2026-05-03  
 **Status:** PASS

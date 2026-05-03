@@ -45,12 +45,19 @@ class GatorTelegramBot:
         return str(data.get("text") or data.get("output") or data.get("response") or "")
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.message.reply_text("Gator Pocket Remote online. Commands: /scan /wakeup")
+        await update.message.reply_text("Gator Pocket Remote online. Commands: /scan /dream")
 
-    async def wakeup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        proc = subprocess.run(["bash", str(GATOR_ROOT / "wakeup")], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        msg = "wakeup completed" if proc.returncode == 0 else "wakeup failed"
-        await update.message.reply_text(msg)
+    async def dream(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        maintenance = GATOR_ROOT / "src" / "maintenance.py"
+        proc = subprocess.run(
+            [str(GATOR_ROOT / "venv" / "bin" / "python"), str(maintenance), "--dream", "--idle-minutes", "0"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=80,
+        )
+        out = (proc.stdout or proc.stderr or "").strip()
+        await update.message.reply_text(out[:3500] if out else "dream complete")
 
     async def scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pulse = GATOR_ROOT / "src" / "pulse_check.py"
@@ -114,7 +121,7 @@ class GatorTelegramBot:
         app = Application.builder().token(self.token).build()
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("scan", self.scan))
-        app.add_handler(CommandHandler("wakeup", self.wakeup))
+        app.add_handler(CommandHandler("dream", self.dream))
         app.add_handler(MessageHandler(filters.VOICE, self.voice_message))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_message))
         app.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -154,10 +161,23 @@ def _main() -> None:
     parser.add_argument("--token", type=str, default=os.environ.get("GATOR_TG_BOT_TOKEN", ""))
     parser.add_argument("--bridge", type=str, default=BRIDGE_URL)
     parser.add_argument("--simulate-voice", type=str, help="Run local voice-note simulation without Telegram")
+    parser.add_argument("--simulate-scan", action="store_true", help="Run local /scan equivalent")
     args = parser.parse_args()
 
     if args.simulate_voice:
         print(json.dumps(simulate_voice_roundtrip(args.simulate_voice, bridge_url=args.bridge), indent=2))
+        return
+
+    if args.simulate_scan:
+        pulse = GATOR_ROOT / "src" / "pulse_check.py"
+        proc = subprocess.run(
+            [str(GATOR_ROOT / "venv" / "bin" / "python"), str(pulse)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=45,
+        )
+        print((proc.stdout or proc.stderr).strip())
         return
 
     if not args.token:

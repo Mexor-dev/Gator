@@ -19,7 +19,7 @@ from urllib import error, request
 GATOR_ROOT = Path.home() / "Gator"
 WAKEUP = GATOR_ROOT / "wakeup"
 MEMORY_CORE = GATOR_ROOT / "src" / "memory_core.py"
-SERVER_URL = "http://127.0.0.1:8080"
+SERVER_URL = "http://127.0.0.1:8081"
 BRIDGE_URL = "http://127.0.0.1:8090"
 
 
@@ -92,7 +92,7 @@ def terminate_stack() -> None:
 
     # Also clear stale processes that may not match current pid files.
     subprocess.run(["bash", "-lc", "pkill -f '/home/user/Gator/src/gator_bridge.py' 2>/dev/null || true"], check=False)
-    subprocess.run(["bash", "-lc", "pkill -f 'llama-server.*--port 8080' 2>/dev/null || true"], check=False)
+    subprocess.run(["bash", "-lc", "pkill -f 'llama-server.*--port 8081' 2>/dev/null || true"], check=False)
 
 
 def vram_check(server_pid: int) -> dict:
