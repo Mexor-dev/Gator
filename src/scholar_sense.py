@@ -259,7 +259,17 @@ class ScholarSense:
         # LanceDB returns distance; map to a bounded similarity score.
         best_dist = float(candidates[0].get("_distance", 1e9) or 1e9)
         best_similarity = 1.0 / (1.0 + max(0.0, best_dist))
-        if best_similarity < SIMILARITY_FLOOR:
+
+        # Enforce a conservative hallucination floor by combining vector similarity
+        # with lexical grounding in the top candidate.
+        q_terms = {w.lower() for w in question.split() if len(w) > 3}
+        top_text = str(candidates[0].get("text", "")).lower()
+        overlap = 0.0
+        if q_terms:
+            overlap = sum(1 for t in q_terms if t in top_text) / max(1, len(q_terms))
+        effective_similarity = best_similarity * max(0.05, overlap)
+
+        if effective_similarity < SIMILARITY_FLOOR:
             return {
                 "question": question,
                 "god_nodes": god_nodes,
@@ -271,6 +281,7 @@ class ScholarSense:
                 "zero_context": True,
                 "floor": SIMILARITY_FLOOR,
                 "best_similarity": round(best_similarity, 4),
+                "effective_similarity": round(effective_similarity, 4),
                 "reason": "SIMILARITY_FLOOR",
             }
 
@@ -315,6 +326,7 @@ class ScholarSense:
             "zero_context": False,
             "floor": SIMILARITY_FLOOR,
             "best_similarity": round(best_similarity, 4),
+            "effective_similarity": round(effective_similarity, 4),
         }
 
 
