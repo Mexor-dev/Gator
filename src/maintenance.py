@@ -102,7 +102,7 @@ class GatorMaintenance:
             tables = tables.tables
         if "scholar_memory" in tables:
             table = self.db.open_table("scholar_memory")
-            rows = table.to_list()
+            rows = table.to_arrow().to_pylist()
             seen: set[str] = set()
             keep = []
             for r in rows:
