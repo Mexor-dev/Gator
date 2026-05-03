@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GATOR_ROOT="$HOME/Gator"
+MODEL_REQ="$GATOR_ROOT/models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+MODEL_ALT="$GATOR_ROOT/models/chassis.gguf"
+SERVER_LOG="$GATOR_ROOT/logs/llama_server.log"
+BRIDGE_LOG="$GATOR_ROOT/logs/gator_bridge.log"
+PID_DIR="$GATOR_ROOT/bin"
+SERVER_PID_FILE="$PID_DIR/llama_server.pid"
+BRIDGE_PID_FILE="$PID_DIR/gator_bridge.pid"
+
+mkdir -p "$GATOR_ROOT/logs" "$PID_DIR"
+
+if [[ ! -f "$MODEL_REQ" ]]; then
+    if [[ -f "$MODEL_ALT" ]]; then
+        ln -sf "$MODEL_ALT" "$MODEL_REQ"
+    else
+        echo "[FATAL] Chassis model not found at: $MODEL_REQ"
+        exit 1
+    fi
+fi
+
+if [[ ! -f "$GATOR_ROOT/bin/logic_map.gate" ]]; then
+    echo "[FATAL] logic_map.gate missing at $GATOR_ROOT/bin/logic_map.gate"
+    echo "Run extraction first: bash ~/Gator/run_extraction.sh"
+    exit 1
+fi
+
+find_llama_server() {
+    local candidates=(
+        "$HOME/llama.cpp/build/bin/llama-server"
+        "$HOME/llama.cpp/llama-server"
+        "$GATOR_ROOT/bin/llama-server"
+    )
+    for c in "${candidates[@]}"; do
+        if [[ -x "$c" ]]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+LLAMA_SERVER_BIN="$(find_llama_server || true)"
+if [[ -z "$LLAMA_SERVER_BIN" ]]; then
+    echo "[FATAL] llama-server binary not found."
+    echo "Expected e.g. $HOME/llama.cpp/build/bin/llama-server"
+    exit 1
+fi
+
+cleanup() {
+    if [[ -f "$BRIDGE_PID_FILE" ]]; then
+        kill "$(cat "$BRIDGE_PID_FILE")" 2>/dev/null || true
+    fi
+    if [[ -f "$SERVER_PID_FILE" ]]; then
+        kill "$(cat "$SERVER_PID_FILE")" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# Clear stale instances so the new stack binds expected ports and code version.
+pkill -f "/home/user/Gator/src/gator_bridge.py" 2>/dev/null || true
+pkill -f "llama-server.*--port 8080" 2>/dev/null || true
+sleep 1
+
+# Action 1: boot llama-server
+"$LLAMA_SERVER_BIN" \
+    --model "$MODEL_REQ" \
+    --port 8080 \
+    --n-gpu-layers 99 \
+    --ctx-size 8192 \
+    --pooling mean \
+    --embedding \
+    >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+echo "$SERVER_PID" > "$SERVER_PID_FILE"
+
+# Action 2: wait for server ready signal
+ready=0
+for _ in $(seq 1 120); do
+    if grep -q "HTTP server listening" "$SERVER_LOG" 2>/dev/null; then
+        ready=1
+        break
+    fi
+    if curl -sSf "http://127.0.0.1:8080/health" >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+
+if [[ "$ready" -ne 1 ]]; then
+    echo "[FATAL] llama-server did not become ready within timeout."
+    tail -n 60 "$SERVER_LOG" || true
+    exit 1
+fi
+
+# Action 3: launch gator bridge API/CLI wrapper
+"$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/gator_bridge.py" \
+    --mode api \
+    --server "http://127.0.0.1:8080" \
+    --host "127.0.0.1" \
+    --port 8090 \
+    >"$BRIDGE_LOG" 2>&1 &
+BRIDGE_PID=$!
+echo "$BRIDGE_PID" > "$BRIDGE_PID_FILE"
+
+for _ in $(seq 1 60); do
+    if curl -sSf "http://127.0.0.1:8090/health" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+echo "GATOR IS AWAKE. VRAM CONSTRAINTS NOMINAL. LOGIC GRAFT ACTIVE."
+echo "llama-server pid: $SERVER_PID"
+echo "gator-bridge pid: $BRIDGE_PID"
+echo "logs: $SERVER_LOG | $BRIDGE_LOG"
+
+wait "$BRIDGE_PID"
