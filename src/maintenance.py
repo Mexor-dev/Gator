@@ -67,11 +67,13 @@ class GatorMaintenance:
             return {"committed": False, "head": (head.stdout or "").strip()}
 
         commit = _run(["git", "commit", "-m", message], cwd=self.root, check=False)
-        if commit.returncode != 0 and "nothing to commit" not in (commit.stdout + commit.stderr).lower():
+        combined = (commit.stdout + commit.stderr).lower()
+        if commit.returncode != 0 and "nothing to commit" not in combined and "nothing added to commit" not in combined:
             raise MaintenanceError(f"git commit failed: {commit.stderr or commit.stdout}")
 
         head = _run(["git", "rev-parse", "--short", "HEAD"], cwd=self.root, check=False)
-        return {"committed": True, "head": (head.stdout or "").strip()}
+        committed = "nothing to commit" not in combined and "nothing added to commit" not in combined
+        return {"committed": committed, "head": (head.stdout or "").strip()}
 
     def _load_state(self) -> dict[str, Any]:
         if not STATE_FILE.exists():
@@ -142,18 +144,26 @@ class GatorMaintenance:
         return self.bus.doctor_query()
 
     def test_restart_attach(self) -> dict[str, Any]:
-        # Simulate crash + autonomous restart and require recovery within 5 seconds.
+        # Simulate crash + autonomous bridge restart and require recovery within 5 seconds.
         _run(["bash", "-lc", "pkill -f '/home/user/Gator/src/gator_bridge.py' 2>/dev/null || true"], check=False)
         t0 = time.perf_counter()
-        _run(["bash", "-lc", "GATOR_DAEMON=true bash /home/user/Gator/wakeup"], check=False)
+
+        _run(
+            [
+                "bash",
+                "-lc",
+                "nohup env GATOR_DEBUG=${GATOR_DEBUG:-false} /home/user/Gator/venv/bin/python /home/user/Gator/src/gator_bridge.py --mode api --server http://127.0.0.1:8081 --host 127.0.0.1 --port 8090 >/home/user/Gator/logs/gator_bridge.log 2>&1 & echo $! >/home/user/Gator/bin/gator_bridge.pid",
+            ],
+            check=False,
+        )
 
         ok = False
-        for _ in range(25):
+        for _ in range(30):
             probe = _run(["bash", "-lc", "curl -s http://127.0.0.1:8090/health"], check=False)
             if '"ok":true' in (probe.stdout or ""):
                 ok = True
                 break
-            time.sleep(0.2)
+            time.sleep(0.15)
 
         elapsed = time.perf_counter() - t0
         return {"recovered": ok, "seconds": round(elapsed, 3), "target_max_seconds": 5.0}
