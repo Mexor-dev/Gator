@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,14 @@ STATE_FILE = GATOR_ROOT / "bin" / "maintenance_state.json"
 
 class MaintenanceError(RuntimeError):
     pass
+
+
+@dataclass
+class PriorityTask:
+    name: str
+    priority: int
+    created_ts: float
+    payload: dict[str, Any] | None = None
 
 
 def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -100,7 +109,48 @@ class GatorMaintenance:
         if idle_for < idle_minutes:
             return {"dream_ran": False, "idle_minutes": round(idle_for, 2)}
 
-        # Consolidation placeholder: prune duplicate rows in scholar_memory by text hash surrogate.
+        queue = self.build_circadian_queue()
+        queue_exec = self.execute_priority_queue(queue)
+
+        data["last_dream_ts"] = now
+        data["last_activity_ts"] = now
+        self._save_state(data)
+
+        return {
+            "dream_ran": True,
+            "idle_minutes": round(idle_for, 2),
+            "queue": queue_exec,
+            "vectors_pruned": int(queue_exec["results"].get("lancedb_prune", {}).get("vectors_pruned", 0)),
+            "graph_updated": bool(queue_exec["results"].get("graphify_promotion", {}).get("graph_updated", False)),
+        }
+
+    def sort_priority_queue(self, tasks: list[PriorityTask]) -> list[PriorityTask]:
+        # BabyAGI-style lightweight array sorting by urgency then insertion time.
+        return sorted(tasks, key=lambda t: (int(t.priority), float(t.created_ts)))
+
+    def build_circadian_queue(self) -> list[PriorityTask]:
+        now = time.time()
+        return self.sort_priority_queue(
+            [
+                PriorityTask(name="rollback_checks", priority=1, created_ts=now),
+                PriorityTask(name="graphify_promotion", priority=2, created_ts=now + 0.01),
+                PriorityTask(name="lancedb_prune", priority=3, created_ts=now + 0.02),
+                PriorityTask(name="pulse_checks", priority=4, created_ts=now + 0.03),
+            ]
+        )
+
+    def _task_rollback_checks(self) -> dict[str, Any]:
+        snap = self.snapshot_state("circadian rollback check")
+        return {"ok": True, "head": snap.get("head"), "committed": bool(snap.get("committed", False))}
+
+    def _task_graphify_promotion(self) -> dict[str, Any]:
+        graphify = Path.home() / ".local" / "bin" / "graphify"
+        if not graphify.exists():
+            return {"ok": False, "graph_updated": False, "reason": "graphify_missing"}
+        proc = _run([str(graphify), "update", str(self.root / "research")], cwd=self.root, check=False)
+        return {"ok": proc.returncode == 0, "graph_updated": proc.returncode == 0}
+
+    def _task_lancedb_prune(self) -> dict[str, Any]:
         pruned = 0
         tables = self.db.list_tables()
         if hasattr(tables, "tables"):
@@ -119,26 +169,41 @@ class GatorMaintenance:
                 keep.append(r)
             if pruned > 0:
                 self.db.drop_table("scholar_memory")
-                # Recreate with existing schema inferred from remaining rows.
                 self.db.create_table("scholar_memory", data=keep, mode="overwrite")
+        return {"ok": True, "vectors_pruned": pruned}
 
-        # Update graph map from research corpus.
-        graphify = Path.home() / ".local" / "bin" / "graphify"
-        graph_updated = False
-        if graphify.exists():
-            proc = _run([str(graphify), "update", str(self.root / "research")], cwd=self.root, check=False)
-            graph_updated = proc.returncode == 0
+    def _task_pulse_checks(self) -> dict[str, Any]:
+        py = self.root / "venv" / "bin" / "python"
+        pulse = self.root / "src" / "pulse_check.py"
+        proc = _run([str(py), str(pulse)], cwd=self.root, check=False)
+        body = (proc.stdout or proc.stderr or "")[-800:]
+        return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "output_tail": body}
 
-        data["last_dream_ts"] = now
-        data["last_activity_ts"] = now
-        self._save_state(data)
+    def execute_priority_queue(self, tasks: list[PriorityTask]) -> dict[str, Any]:
+        ordered = self.sort_priority_queue(tasks)
+        order = [t.name for t in ordered]
+        results: dict[str, Any] = {}
 
-        return {
-            "dream_ran": True,
-            "idle_minutes": round(idle_for, 2),
-            "vectors_pruned": pruned,
-            "graph_updated": graph_updated,
-        }
+        for task in ordered:
+            if task.name == "rollback_checks":
+                results[task.name] = self._task_rollback_checks()
+            elif task.name == "graphify_promotion":
+                results[task.name] = self._task_graphify_promotion()
+            elif task.name == "lancedb_prune":
+                results[task.name] = self._task_lancedb_prune()
+            elif task.name == "pulse_checks":
+                results[task.name] = self._task_pulse_checks()
+            elif task.name.startswith("mock_"):
+                results[task.name] = {
+                    "ok": True,
+                    "executed": True,
+                    "payload": task.payload or {},
+                    "priority": task.priority,
+                }
+            else:
+                results[task.name] = {"ok": False, "reason": "unknown_task"}
+
+        return {"ordered": order, "results": results}
 
     def doctor_query(self) -> dict[str, Any]:
         return self.bus.doctor_query()

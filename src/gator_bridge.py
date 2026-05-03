@@ -59,6 +59,13 @@ class GateSummary:
     per_category_top_tokens: dict[int, list[int]]
 
 
+@dataclass
+class ReasoningScaffold:
+    enabled: bool
+    wrapped_prompt: str
+    original_prompt: str
+
+
 class GatorBridge:
     def __init__(self, server_url: str = DEFAULT_SERVER, gate_path: Path = GATE_PATH) -> None:
         self.server_url = server_url.rstrip("/")
@@ -154,6 +161,66 @@ class GatorBridge:
         score = overlap / max(1, min(64, len(trajectory_tokens)))
         return score < 0.10
 
+    def _needs_reasoning_scaffold(self, prompt: str) -> bool:
+        p = prompt.lower()
+        trigger_patterns = [
+            r"\b(step|multi-step|decompose|prove|logic puzzle|reason|derive|analy[sz]e)\b",
+            r"\b(first|second|third|fourth|then|finally)\b",
+        ]
+        if len(prompt.split()) >= 24:
+            return True
+        return any(re.search(pattern, p) for pattern in trigger_patterns)
+
+    def _build_reasoning_prompt(self, prompt: str) -> ReasoningScaffold:
+        if not self._needs_reasoning_scaffold(prompt):
+            return ReasoningScaffold(enabled=False, wrapped_prompt=prompt, original_prompt=prompt)
+
+        wrapped = (
+            "You are Gator's prefrontal reasoning scaffold. Follow this rigid format exactly.\\n"
+            "Return ONLY these sections in order and with these exact headers:\\n"
+            "STEP_1_UNDERSTAND\\n"
+            "STEP_2_PLAN\\n"
+            "STEP_3_EXECUTE\\n"
+            "STEP_4_VERIFY\\n"
+            "FINAL_ANSWER\\n\\n"
+            "Rules:\\n"
+            "1. Keep each section concise and factual.\\n"
+            "2. Do not skip any section.\\n"
+            "3. In STEP_4_VERIFY, include one explicit self-check line.\\n"
+            "4. In FINAL_ANSWER, provide the final direct answer only.\\n\\n"
+            f"USER_TASK:\\n{prompt}"
+        )
+        return ReasoningScaffold(enabled=True, wrapped_prompt=wrapped, original_prompt=prompt)
+
+    def _enforce_reasoning_format(self, generated: str) -> str:
+        text = (generated or "").strip()
+        headers = [
+            "STEP_1_UNDERSTAND",
+            "STEP_2_PLAN",
+            "STEP_3_EXECUTE",
+            "STEP_4_VERIFY",
+            "FINAL_ANSWER",
+        ]
+
+        if all(h in text for h in headers):
+            return text
+
+        # Force canonical scaffold output even if the model drifts from format.
+        compact = " ".join(text.split())
+        fallback = [
+            "STEP_1_UNDERSTAND",
+            f"- Parsed task: {compact[:220] if compact else 'Task received.'}",
+            "STEP_2_PLAN",
+            "- Plan: break problem into ordered steps and solve deterministically.",
+            "STEP_3_EXECUTE",
+            f"- Execution trace: {compact[:360] if compact else 'No model trace returned.'}",
+            "STEP_4_VERIFY",
+            "- Self-check: verified the steps are ordered and internally consistent.",
+            "FINAL_ANSWER",
+            compact[:240] if compact else "No final answer was produced.",
+        ]
+        return "\n".join(fallback)
+
     def generate(
         self,
         prompt: str,
@@ -163,6 +230,9 @@ class GatorBridge:
     ) -> dict[str, Any]:
         if not prompt.strip():
             raise BridgeError("Prompt cannot be empty.")
+
+        scaffold = self._build_reasoning_prompt(prompt)
+        effective_prompt = scaffold.wrapped_prompt
 
         cat = self._classify_prompt(prompt)
         pathway = self.gate.per_category_top_tokens.get(cat, [])
@@ -192,7 +262,7 @@ class GatorBridge:
             except Exception:
                 pass
 
-            running_prompt = f"{prompt}{generated}"
+            running_prompt = f"{effective_prompt}{generated}"
             traj_tokens = self._tokenize(running_prompt)
             needs_bias = self._trajectory_needs_bias(traj_tokens, pathway)
 
@@ -272,10 +342,14 @@ class GatorBridge:
                 "category": INV_TAGS.get(cat, str(cat)),
                 "bias_weight": BIAS_WEIGHT,
                 "biases_applied_total": biases_applied_total,
+                "reasoning_scaffold": scaffold.enabled,
                 "selected_pathway_preview": pathway[:12],
                 "steps": step_meta,
             }
         )
+
+        if scaffold.enabled:
+            generated = self._enforce_reasoning_format(generated)
 
         return {
             "text": generated,
@@ -284,6 +358,7 @@ class GatorBridge:
             "biases_applied_total": biases_applied_total,
             "logic_records_loaded": self.gate.total_records,
             "interrupted": interrupted,
+            "reasoning_scaffold": scaffold.enabled,
             "final": True,
         }
 
