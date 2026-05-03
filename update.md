@@ -2,6 +2,119 @@
 
 ---
 
+## 2026-05-03 Directive Rebuild (Event-Bus + Pulse Loop)
+
+### PHASE 1: Brain & Event-Bus Stabilization
+Status: PASS
+
+Implemented:
+- Added UDS event-bus control plane at `/tmp/gator_event.bus` via `src/event_bus.py`.
+- `wakeup` now starts event-bus first and verifies socket readiness before model/bridge READY.
+- `src/gator_bridge.py` now publishes DNA packets per step and enforces final handshake:
+  - emits start packet
+  - emits token-step packets
+  - emits required `{"final": true}` packet
+  - returns response only after final packet ack from event-bus.
+- Added interrupt consumption in generation loop through event-bus.
+
+Validation:
+- 50x hi loop test (`src/phase1_eventbus_test.py`):
+  - `truncation_count=0`
+  - `final_packets_delta=100` (>=50 expected)
+  - VRAM stable around `2187-2190 MiB / 6144 MiB`
+  - status PASS
+
+### PHASE 2: Memory Retrieval & Hallucination Floor
+Status: PASS
+
+Implemented:
+- `src/scholar_sense.py` now enforces `SIMILARITY_FLOOR = 0.25` with conservative effective similarity:
+  - vector similarity (from LanceDB distance)
+  - multiplied by lexical grounding overlap
+  - below floor returns ZERO_CONTEXT (empty context, reason `SIMILARITY_FLOOR`).
+- Vector Pivot still active using Graphify God Nodes.
+
+Validation:
+- Medication query: non-empty context, `zero_context=false`, `effective_similarity=0.4548`.
+- Irrelevant weather query: `zero_context=true`, `effective_similarity=0.0414`, reason `SIMILARITY_FLOOR`.
+
+### PHASE 3: Scout & Architect
+Status: PASS
+
+Implemented:
+- `src/tools/scout.py` (Camofox-style local CDP attach + immediate teardown).
+- `src/skills.py` recursive self-improvement: generate -> sandbox-test -> persist skill node.
+
+Validation:
+- Stealth scrape on `https://bot.sannysoft.com`:
+  - title `Antibot`
+  - chars `1456`
+  - memory id stored to LanceDB.
+- Self-coding skill test:
+  - generated `src/tools/generated/phase3_probe.py`
+  - sandbox exit code `0`
+  - skill node persisted.
+
+### PHASE 4: Ambient Senses (Voice & Pocket UI)
+Status: PASS (local simulation path)
+
+Implemented:
+- `src/interfaces/voice_layer.py` CPU-only STT/TTS (faster-whisper + piper).
+- `src/interfaces/tg_bot.py` supports voice notes, text, `/scan`, `/dream`.
+
+Validation:
+- Voice-note simulation:
+  - input: "run a dream cycle and report vitals"
+  - STT transcribed successfully
+  - bridge inference returned
+  - TTS reply WAV created in `logs/phase4_out_*.wav`.
+- Dream command path validated via maintenance daemon.
+
+### PHASE 5: Immune System & Maintenance
+Status: PASS
+
+Implemented:
+- `src/maintenance.py`:
+  - git mirror snapshot before dream cycle
+  - dream consolidation + Graphify update
+  - rollback on failure
+  - doctor query over event-bus
+  - crash/restart recovery test hook.
+
+Validation:
+- Doctor query returns live heartbeat and packet counters from event-bus.
+- Rollback test: forced failure exit `42` -> `rolled_back=true`.
+- Restart recovery test: `recovered=true` in `0.036s` (target <=5s).
+
+### PHASE 6: Surgical UI & Vitals
+Status: PASS
+
+Implemented:
+- `src/pulse_check.py` benchmarks TPS + graft integrity + doctor telemetry.
+- `src/interfaces/webui.py` on `localhost:8080`:
+  - Graph map embed (`/graph`)
+  - live vitals widget
+  - debug tail viewer
+  - Interrupt button wired to event-bus (`POST /api/interrupt`).
+
+Validation:
+- `/scan` simulation returned Pulse PASS with alive PIDs and donor bias active.
+- Graph endpoint render check: HTTP 200, html bytes `13521`.
+- Interrupt test:
+  - `/api/interrupt` -> `interrupt_pending=true`
+  - next generation returned `interrupted=true` and `final=true`.
+- Pulse final:
+  - status PASS
+  - TPS observed `48.6 tok/s` sample
+  - VRAM `2189 MiB / 6144 MiB`
+  - doctor telemetry reports heartbeat + interrupt counters.
+
+### Notes on Donor Protocol
+- Donor logic was recoded natively into `src/` with minimal dependencies.
+- OpenClaw direct clone was previously auth-gated in this environment; Telegram bridge behavior was recoded natively to match required function set.
+
+---
+
 ## PHASE 6: Vitals & Surgical UI
 **Date:** 2026-05-03  
 **Status:** PASS
