@@ -303,10 +303,10 @@ import sys
 sys.path.insert(0, '/home/user/Gator/src')
 
 try:
-    from pulse_check import run_pulse_check
+    from pulse_check import run_pulse
     from interfaces.webui import app
     
-    status = 'PASS' if (run_pulse_check is not None and app is not None) else 'FAIL'
+    status = 'PASS' if (run_pulse is not None and app is not None) else 'FAIL'
     print(f'{{"pulse": true, "webui": true, "status": "{status}"}}')
 except Exception as e:
     print(f'{{"error": "{str(e)}", "status": "FAIL"}}')
