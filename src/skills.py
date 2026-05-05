@@ -1,4 +1,4 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Phase 3 Architect: recursive skill creation and persistence.
 
 Given a requested missing tool, generate a Python script, sandbox-test it,
@@ -24,7 +24,7 @@ import pyarrow as pa
 
 from memory_core import GatorMemoryCore
 
-GATOR_ROOT = Path.home() / "Gator"
+GATOR_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = GATOR_ROOT / "src" / "tools" / "generated"
 RESEARCH_SKILLS_DIR = GATOR_ROOT / "research" / "skills"
 GRAPHIFY_BIN = Path.home() / ".local" / "bin" / "graphify"
@@ -97,7 +97,7 @@ class SkillArchitect:
         safe_name = skill_name.replace("-", "_")
         return textwrap.dedent(
             f"""
-            #!/home/user/Gator/venv/bin/python3
+            #!/usr/bin/env python3
             \"\"\"Auto-generated skill: {safe_name}.\"\"\"
 
             from __future__ import annotations
@@ -255,7 +255,7 @@ class SkillArchitect:
             script_path = TOOLS_DIR / task.params.get("script_name", "generated_task.py")
             script_code = textwrap.dedent(
                 """
-                #!/home/user/Gator/venv/bin/python3
+                #!/usr/bin/env python3
                 from datetime import date
 
 

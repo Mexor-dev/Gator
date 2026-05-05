@@ -1,5 +1,5 @@
-#!/home/user/Gator/venv/bin/python3
-"""Phase 1 post-genesis verification for Hermes-style scaffolding."""
+#!/usr/bin/env python3
+"""Phase 1 post-genesis verification for local reasoning scaffolding."""
 
 from __future__ import annotations
 

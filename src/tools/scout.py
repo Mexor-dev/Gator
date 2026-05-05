@@ -1,4 +1,4 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Phase 3 Scout: lightweight local CDP stealth scraper.
 
 Implements donor-inspired flow:

@@ -1,4 +1,4 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Auto-generated skill: phase3_probe."""
 
 from __future__ import annotations

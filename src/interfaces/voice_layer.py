@@ -1,10 +1,16 @@
 #!/home/user/Gator/venv/bin/python3
-"""Phase 4 voice layer: CPU Whisper STT + Piper TTS."""
+"""Phase 4 voice layer: CPU Whisper STT + Piper TTS.
+
+Voice is a PRIME-ONLY privilege.  Any clone or non-Prime entity that
+calls transcribe_wav() or synthesize_to_wav() receives a VoiceHardBlock
+and is redirected to the text logger.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -15,10 +21,43 @@ GATOR_ROOT = Path.home() / "Gator"
 VOICE_DIR = GATOR_ROOT / "models" / "voice"
 PIPER_MODEL = VOICE_DIR / "en_US-lessac-medium.onnx"
 PIPER_CONFIG = VOICE_DIR / "en_US-lessac-medium.onnx.json"
+VOICE_LOG = GATOR_ROOT / "logs" / "voice_text_log.jsonl"
+
+# Entity names that are allowed to use the voice layer.
+_PRIME_ENTITY_NAMES: frozenset[str] = frozenset({"", "gator-prime", "prime", "gator"})
+
+
+def _is_prime() -> bool:
+    """Return True only when running as Gator-Prime."""
+    node_name = os.environ.get("GATOR_NODE_NAME", "").strip().lower()
+    return node_name in _PRIME_ENTITY_NAMES
 
 
 class VoiceLayerError(RuntimeError):
     pass
+
+
+class VoiceHardBlock(VoiceLayerError):
+    """Raised when a non-Prime entity attempts to use the voice layer.
+
+    Callers should catch this and route to the text logger instead.
+    """
+
+    def __init__(self, entity: str) -> None:
+        self.entity = entity
+        super().__init__(
+            f"HardBlock: Voice layer is restricted to Gator-Prime. "
+            f"Entity '{entity}' is TEXT-ONLY. Request diverted to text logger."
+        )
+
+
+def _text_log_fallback(text: str, entity: str | None = None) -> dict[str, Any]:
+    """Write text to the voice text-log file and return a status dict."""
+    VOICE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"entity": entity or os.environ.get("GATOR_NODE_NAME", "unknown"), "text": text}
+    with VOICE_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+    return {"hard_block": True, "logged_text": text, "entity": entry["entity"]}
 
 
 class VoiceLayer:
@@ -26,6 +65,9 @@ class VoiceLayer:
         self.whisper_model_size = whisper_model_size
         self.whisper_compute_type = whisper_compute_type
         self._whisper: WhisperModel | None = None
+        # Eagerly check identity so callers can inspect before making calls.
+        self.voice_disabled: bool = not _is_prime()
+        self._entity: str = os.environ.get("GATOR_NODE_NAME", "Gator-Prime")
 
     def ensure_piper_model(self) -> dict[str, str]:
         VOICE_DIR.mkdir(parents=True, exist_ok=True)
@@ -53,6 +95,8 @@ class VoiceLayer:
         return self._whisper
 
     def transcribe_wav(self, wav_path: Path, language: str = "en") -> dict[str, Any]:
+        if self.voice_disabled:
+            raise VoiceHardBlock(self._entity)
         if not wav_path.exists():
             raise VoiceLayerError(f"Audio file not found: {wav_path}")
 
@@ -67,6 +111,8 @@ class VoiceLayer:
         }
 
     def synthesize_to_wav(self, text: str, out_path: Path) -> dict[str, Any]:
+        if self.voice_disabled:
+            raise VoiceHardBlock(self._entity)
         self.ensure_piper_model()
         if not text.strip():
             raise VoiceLayerError("Cannot synthesize empty text")
@@ -88,6 +134,10 @@ class VoiceLayer:
             raise VoiceLayerError(f"Piper failed: {(proc.stderr or proc.stdout).decode('utf-8', errors='replace')}")
 
         return {"output_wav": str(out_path), "bytes": out_path.stat().st_size}
+
+    def text_log_fallback(self, text: str) -> dict[str, Any]:
+        """Divert text to the voice log when voice is hard-blocked."""
+        return _text_log_fallback(text, entity=self._entity)
 
 
 def _main() -> None:

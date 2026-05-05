@@ -1,4 +1,4 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Gator UDS event-bus daemon and client helpers.
 
 Socket path: /tmp/gator_event.bus
@@ -7,6 +7,7 @@ Socket path: /tmp/gator_event.bus
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 import socket
@@ -33,9 +34,19 @@ class EventBusClient:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
         try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
             sock.connect(str(self.bus_path))
             sock.sendall((json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8"))
-            data = sock.recv(65536).decode("utf-8", errors="replace").strip()
+            parts: list[bytes] = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                parts.append(chunk)
+                if b"\n" in chunk:
+                    break
+            data = b"".join(parts).decode("utf-8", errors="replace").strip()
             if not data:
                 return {"ok": False, "error": "empty bus response"}
             return json.loads(data)
@@ -54,6 +65,12 @@ class EventBusClient:
     def consume_interrupt(self) -> dict[str, Any]:
         return self._request({"op": "consume_interrupt"})
 
+    def consume_packets(self, after_seq: int = 0, request_id: str | None = None, limit: int = 256) -> dict[str, Any]:
+        payload: dict[str, Any] = {"op": "consume_packets", "after_seq": int(after_seq), "limit": int(limit)}
+        if request_id:
+            payload["request_id"] = str(request_id)
+        return self._request(payload)
+
 
 class EventBusDaemon:
     def __init__(self, bus_path: Path = BUS_PATH) -> None:
@@ -67,19 +84,27 @@ class EventBusDaemon:
             "interrupt_pending": False,
             "interrupt_count": 0,
             "last_packet": None,
+            "last_seq": 0,
+            "packets": deque(maxlen=2048),
         }
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
     def _handle_packet(self, packet: dict[str, Any]) -> None:
         with self._lock:
+            seq = self.state["last_seq"] + 1
+            stored_packet = dict(packet)
+            stored_packet["seq"] = seq
+            self.state["last_seq"] = seq
             self.state["total_packets"] += 1
-            self.state["last_packet"] = packet
+            self.state["last_packet"] = stored_packet
             self.state["heartbeat_ts"] = time.time()
-            if "vram" in packet:
-                self.state["last_vram"] = packet.get("vram", "")
-            if bool(packet.get("final", False)):
+            if "vram" in stored_packet:
+                self.state["last_vram"] = stored_packet.get("vram", "")
+            if bool(stored_packet.get("final", False)):
                 self.state["final_packets"] += 1
+            packets: deque[dict[str, Any]] = self.state["packets"]
+            packets.append(stored_packet)
 
     def _doctor_snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -99,6 +124,18 @@ class EventBusDaemon:
             pending = bool(self.state["interrupt_pending"])
             self.state["interrupt_pending"] = False
             return {"ok": True, "interrupt": pending}
+
+    def _consume_packets(self, after_seq: int, request_id: str | None, limit: int) -> dict[str, Any]:
+        with self._lock:
+            packets = [pkt for pkt in self.state["packets"] if int(pkt.get("seq", 0)) > after_seq]
+            if request_id:
+                packets = [pkt for pkt in packets if str(pkt.get("request_id", "")) == request_id]
+            packets = packets[: max(1, min(int(limit), 512))]
+            return {
+                "ok": True,
+                "packets": packets,
+                "last_seq": self.state["last_seq"],
+            }
 
     def _set_interrupt(self) -> dict[str, Any]:
         with self._lock:
@@ -128,11 +165,31 @@ class EventBusDaemon:
             if op == "consume_interrupt":
                 conn.sendall((json.dumps(self._consume_interrupt(), ensure_ascii=True) + "\n").encode("utf-8"))
                 return
+            if op == "consume_packets":
+                after_seq = int(req.get("after_seq", 0) or 0)
+                request_id = req.get("request_id")
+                limit = int(req.get("limit", 256) or 256)
+                conn.sendall((json.dumps(self._consume_packets(after_seq, request_id, limit), ensure_ascii=True) + "\n").encode("utf-8"))
+                return
             conn.sendall(b'{"ok":false,"error":"unknown_op"}\n')
         except Exception as exc:
-            conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode("utf-8"))
+            try:
+                conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode("utf-8"))
+            except Exception:
+                pass
         finally:
             conn.close()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(0.2)
+            sock.connect(str(self.bus_path))
+            sock.sendall(b'{"op":"doctor_query"}\n')
+            sock.close()
+        except Exception:
+            pass
 
     def run(self) -> None:
         if self.bus_path.exists():
@@ -141,7 +198,7 @@ class EventBusDaemon:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(self.bus_path))
         os.chmod(self.bus_path, 0o666)
-        server.listen(64)
+        server.listen(256)
         server.settimeout(1.0)
 
         try:
@@ -150,8 +207,7 @@ class EventBusDaemon:
                     conn, _ = server.accept()
                 except socket.timeout:
                     continue
-                t = threading.Thread(target=self._handle_conn, args=(conn,), daemon=True)
-                t.start()
+                self._handle_conn(conn)
         finally:
             server.close()
             if self.bus_path.exists():

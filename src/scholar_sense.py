@@ -1,4 +1,4 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Project Gator - Phase 2 Scholar Sense (Hybrid RAG).
 
 Builds a CPU/SSD graph layer via graphify and a semantic vector layer via
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import subprocess
 import time
 import uuid
@@ -24,7 +25,7 @@ from pypdf import PdfReader
 
 from memory_core import GatorMemoryCore, MemoryCoreError
 
-GATOR_ROOT = Path.home() / "Gator"
+GATOR_ROOT = Path(__file__).resolve().parents[1]
 RESEARCH_ROOT = GATOR_ROOT / "research"
 GRAPH_OUT = RESEARCH_ROOT / "graphify-out"
 TABLE_NAME = "scholar_memory"
@@ -50,8 +51,10 @@ class ScholarSense:
         RESEARCH_ROOT.mkdir(parents=True, exist_ok=True)
         GRAPH_OUT.mkdir(parents=True, exist_ok=True)
 
-        self.mem = GatorMemoryCore(server_url=self.server_url)
-        self.db = lancedb.connect(str(GATOR_ROOT / "db"))
+        shared_db = os.environ.get("GATOR_SHARED_DB", "").strip()
+        db_path = Path(shared_db) if shared_db else (GATOR_ROOT / "db")
+        self.mem = GatorMemoryCore(db_path=db_path, server_url=self.server_url)
+        self.db = lancedb.connect(str(db_path))
 
     def _schema_for_dim(self, dim: int) -> pa.Schema:
         return pa.schema(
@@ -183,11 +186,15 @@ class ScholarSense:
         vec, _ = self.mem._embed_text(text)
         return vec
 
-    def ingest_pdf(self, pdf_path: Path) -> dict[str, Any]:
+    def ingest_pdf(self, pdf_path: Path, progress_callback: Any | None = None) -> dict[str, Any]:
+        if progress_callback:
+            progress_callback("shredding", 20, {"pdf": str(pdf_path)})
         text = self._extract_text_from_pdf(pdf_path)
         sidecar = RESEARCH_ROOT / f"{pdf_path.stem}.md"
         sidecar.write_text(text, encoding="utf-8")
 
+        if progress_callback:
+            progress_callback("distillation", 55, {"text_chars": len(text)})
         graph_info = self._run_graphify_update()
 
         chunks = self._chunk_text(text)
@@ -199,6 +206,9 @@ class ScholarSense:
         sample_vec = self._embed(chunks[0])
         dim = len(sample_vec)
         table = self._open_or_create_table(dim)
+
+        if progress_callback:
+            progress_callback("indexing", 80, {"chunks": len(chunks), "vector_dim": dim})
 
         rows = []
         for idx, chunk in enumerate(chunks):
@@ -216,7 +226,7 @@ class ScholarSense:
 
         table.add(rows)
 
-        return {
+        result = {
             "pdf": str(pdf_path),
             "graph_source_sidecar": str(sidecar),
             "chunks": len(chunks),
@@ -225,6 +235,9 @@ class ScholarSense:
             "assigned_node_ids": len(default_nodes),
             "table": TABLE_NAME,
         }
+        if progress_callback:
+            progress_callback("complete", 100, result)
+        return result
 
     def query(self, question: str, top_k: int = 8, token_cap: int = 768) -> dict[str, Any]:
         if token_cap > 768:

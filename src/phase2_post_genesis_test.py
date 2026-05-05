@@ -1,4 +1,4 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Phase 2 post-genesis verification for BabyAGI-style priority queue."""
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Project Gator - Step 6 validation harness.
 
 Checks:

@@ -1,4 +1,4 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Phase 4 Pocket Remote: Telegram bot bridge for text and voice."""
 
 from __future__ import annotations

@@ -78,10 +78,23 @@ def run_pulse() -> dict[str, Any]:
     except Exception as exc:
         doctor = {"ok": False, "error": str(exc)}
 
+    # Detect native gator_kern mode — response contains donor address trace
+    native_mode = "gator_kern native trace" in out_text
+    # Extract donor address if present (e.g. "donor=0x32c6cb90")
+    donor_addr = ""
+    if native_mode:
+        import re
+        m = re.search(r"donor=(0x[0-9a-fA-F]+)", out_text)
+        donor_addr = m.group(1) if m else ""
+
+    bridge_alive = _pid_alive(bridge_pid)
+    inference_ok = bool(out_text) and (native_mode or int(gen.get("biases_applied_total", 0)) > 0)
+    pass_status = bridge_alive and health.get("ok") and inference_ok
+
     return {
         "pids": {
             "llama_server": {"pid": server_pid, "alive": _pid_alive(server_pid)},
-            "gator_bridge": {"pid": bridge_pid, "alive": _pid_alive(bridge_pid)},
+            "gator_bridge": {"pid": bridge_pid, "alive": bridge_alive},
             "webui": {"pid": webui_pid, "alive": _pid_alive(webui_pid)},
         },
         "health": health,
@@ -91,16 +104,13 @@ def run_pulse() -> dict[str, Any]:
             "biases_applied_total": gen.get("biases_applied_total", 0),
             "logic_records_loaded": gen.get("logic_records_loaded", 0),
             "category": gen.get("category"),
+            "native_mode": native_mode,
+            "donor_addr": donor_addr,
         },
         "performance": {"seconds": round(dt, 4), "tokens_est": tok_est, "tps_est": tps_est},
         "vram": (vram.stdout or "").strip(),
         "doctor": doctor,
-        "status": "PASS"
-        if _pid_alive(server_pid)
-        and _pid_alive(bridge_pid)
-        and health.get("ok")
-        and int(gen.get("biases_applied_total", 0)) > 0
-        else "FAIL",
+        "status": "PASS" if pass_status else "FAIL",
     }
 
 

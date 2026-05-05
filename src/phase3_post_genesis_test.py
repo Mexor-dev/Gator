@@ -1,4 +1,4 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Phase 3 post-genesis verification for Jarvis-style decomposition."""
 
 from __future__ import annotations

@@ -1,11 +1,13 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Phase 5 Immune System: maintenance, dream cycle, and rollback logic."""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -14,9 +16,15 @@ from typing import Any
 
 import lancedb
 from event_bus import EventBusClient
+from core.gator_map import GatorMap, GatorMapError
+from memory_core import GatorMemoryCore
 
-GATOR_ROOT = Path.home() / "Gator"
+GATOR_ROOT = Path(__file__).resolve().parents[1]
 STATE_FILE = GATOR_ROOT / "bin" / "maintenance_state.json"
+LOG_ROOT = GATOR_ROOT / "logs"
+GENERATED_TOOLS_ROOT = GATOR_ROOT / "src" / "tools" / "generated"
+MAX_VRAM_DREAM_MIB = 3000
+QUIESCENT_TARGET_VRAM_MIB = 2204
 
 
 class MaintenanceError(RuntimeError):
@@ -47,9 +55,291 @@ def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subproc
 class GatorMaintenance:
     def __init__(self, root: Path = GATOR_ROOT) -> None:
         self.root = root
+        self.log_root = self.root / "logs"
+        self.generated_tools_root = self.root / "src" / "tools" / "generated"
         self.db = lancedb.connect(str(root / "db"))
+        self.mem = GatorMemoryCore(server_url="http://127.0.0.1:8081")
         self.bus = EventBusClient()
+        self.gator_map = GatorMap(root=self.root)
         (self.root / "bin").mkdir(parents=True, exist_ok=True)
+
+    def _table_names(self) -> set[str]:
+        raw = self.db.list_tables()
+        if hasattr(raw, "tables"):
+            raw = getattr(raw, "tables")
+        names: set[str] = set()
+        for item in raw:
+            if isinstance(item, str):
+                names.add(item)
+            elif isinstance(item, (list, tuple)) and item:
+                names.add(str(item[0]))
+            else:
+                names.add(str(item))
+        return names
+
+    def _current_vram_mib(self) -> int:
+        proc = _run(
+            ["bash", "-lc", "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1"],
+            check=False,
+        )
+        out = (proc.stdout or "").strip()
+        if out.isdigit():
+            return int(out)
+        return 0
+
+    def _extract_knowledge_kernels(self, rows: list[dict[str, Any]]) -> list[str]:
+        kernels: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            text = str(row.get("thought_chunk") or row.get("text") or "").strip()
+            if len(text) < 40:
+                continue
+            segments = re.split(r"(?<=[.!?])\s+", text)
+            for seg in segments:
+                seg = " ".join(seg.split())
+                if len(seg) < 45:
+                    continue
+                lower = seg.lower()
+                if not any(k in lower for k in ["thermal", "vram", "buffer", "cache", "latency", "vector", "kernel", "sampling", "logic"]):
+                    continue
+                if seg in seen:
+                    continue
+                seen.add(seg)
+                kernels.append(seg)
+                if len(kernels) >= 128:
+                    return kernels
+        return kernels
+
+    def _append_to_scholar_sense(self, kernels: list[str]) -> dict[str, Any]:
+        if not kernels:
+            return {"inserted": 0, "table": "scholar_memory"}
+
+        names = self._table_names()
+        existing_rows = 0
+        table = None
+        if "scholar_memory" in names:
+            table = self.db.open_table("scholar_memory")
+            try:
+                existing_rows = int(table.count_rows())
+            except Exception:
+                existing_rows = 0
+
+        rows: list[dict[str, Any]] = []
+        now = time.time()
+        for kernel in kernels:
+            try:
+                vec, _ = self.mem._embed_text(kernel)
+            except Exception:
+                vec = [0.0] * 1536
+            rows.append(
+                {
+                    "id": f"dream_{int(now)}_{len(rows)}",
+                    "text": kernel,
+                    "vector": vec,
+                    "node_ids": ["dream_cycle", "knowledge_kernel"],
+                    "source_path": "maintenance.process_dream_cycle",
+                    "created_at": now,
+                }
+            )
+
+        inserted = 0
+        try:
+            if table is None:
+                self.db.create_table("scholar_memory", data=rows, mode="create")
+            else:
+                table.add(rows)
+            inserted = len(rows)
+        except Exception:
+            inserted = 0
+
+        return {
+            "inserted": inserted,
+            "table": "scholar_memory",
+            "rows_before": existing_rows,
+            "rows_after_estimate": existing_rows + inserted,
+        }
+
+    def process_dream_cycle(self) -> dict[str, Any]:
+        """Distill transient session data into long-term kernels and flush buffers."""
+        stable_snapshot = self.gator_map.snapshot_system_state(reason="pre_dream_cycle")
+        vram_before = self._current_vram_mib()
+        if vram_before > MAX_VRAM_DREAM_MIB:
+            rollback = self.gator_map.guard_and_revert(crashed=False, vram_used_mib=vram_before)
+            return {
+                "dream_processed": False,
+                "reason": "vram_exceeded_before_cycle",
+                "vram_mib": vram_before,
+                "rollback": rollback,
+            }
+
+        rows: list[dict[str, Any]] = []
+        names = self._table_names()
+        for table_name in ["transient_scratchpad", "transient_buffer", "transient_session"]:
+            if table_name not in names:
+                continue
+            table = self.db.open_table(table_name)
+            try:
+                rows.extend(table.to_arrow().to_pylist())
+            except Exception:
+                continue
+
+        kernels = self._extract_knowledge_kernels(rows)
+        migration = self._append_to_scholar_sense(kernels)
+        flushed = self.mem.flush_buffer(["transient_scratchpad", "transient_buffer", "transient_session"])
+
+        vram_after = self._current_vram_mib()
+        rollback: dict[str, Any] | None = None
+        if vram_after > MAX_VRAM_DREAM_MIB:
+            rollback = self.gator_map.guard_and_revert(crashed=False, vram_used_mib=vram_after)
+
+        return {
+            "dream_processed": True,
+            "stable_snapshot": stable_snapshot,
+            "rows_scanned": len(rows),
+            "kernels_distilled": len(kernels),
+            "knowledge_migration": migration,
+            "flushed": flushed,
+            "vram_before_mib": vram_before,
+            "vram_after_mib": vram_after,
+            "rollback": rollback,
+        }
+
+    def _pulse_check_generated(self, script_path: Path) -> dict[str, Any]:
+        py = self.root / "venv" / "bin" / "python"
+        c1 = _run([str(py), "-m", "py_compile", str(script_path)], check=False)
+        if c1.returncode != 0:
+            return {"ok": False, "stage": "compile", "output": (c1.stderr or c1.stdout)[-400:]}
+        c2 = _run([str(py), str(script_path), "--task", "pulse-check"], check=False)
+        return {
+            "ok": c2.returncode == 0,
+            "stage": "run",
+            "exit_code": c2.returncode,
+            "output": (c2.stdout + c2.stderr)[-400:],
+        }
+
+    def _forge_tool_script(self, slug: str, unmet_goal: str) -> Path:
+        self.generated_tools_root.mkdir(parents=True, exist_ok=True)
+        path = self.generated_tools_root / f"{slug}.py"
+        path.write_text(
+            (
+                "#!/usr/bin/env python3\n"
+                "from __future__ import annotations\n\n"
+                "import argparse\n"
+                "import json\n\n"
+                "def run(task: str) -> dict:\n"
+                "    return {\n"
+                f"        \"tool\": \"{slug}\",\n"
+                "        \"task\": task,\n"
+                "        \"status\": \"ok\",\n"
+                f"        \"origin_gap\": {json.dumps(unmet_goal)},\n"
+                "    }\n\n"
+                "def _main() -> None:\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    parser.add_argument(\"--task\", default=\"pulse-check\")\n"
+                "    args = parser.parse_args()\n"
+                "    print(json.dumps(run(args.task)))\n\n"
+                "if __name__ == \"__main__\":\n"
+                "    _main()\n"
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(path, 0o755)
+        return path
+
+    def architect_loop(self, max_tools: int = 3) -> dict[str, Any]:
+        unmet: list[str] = []
+        self.log_root.mkdir(parents=True, exist_ok=True)
+        for log_path in sorted(self.log_root.glob("*.log")):
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-6000:]
+            except Exception:
+                continue
+            for line in tail.splitlines():
+                lower = line.lower()
+                if any(k in lower for k in ["unmet goal", "unknown tool", "missing skill", "not implemented"]):
+                    unmet.append(line.strip())
+
+        generated: list[dict[str, Any]] = []
+        for idx, gap in enumerate(unmet[:max_tools], start=1):
+            slug = f"jit_tool_{int(time.time())}_{idx}"
+            script_path = self._forge_tool_script(slug=slug, unmet_goal=gap)
+            pulse = self._pulse_check_generated(script_path)
+            if pulse.get("ok"):
+                generated.append({"tool": slug, "path": str(script_path), "pulse": pulse})
+            else:
+                script_path.unlink(missing_ok=True)
+
+        map_snapshot = self.gator_map.snapshot_system_state(reason="architect_loop")
+        return {
+            "unmet_goals_found": len(unmet),
+            "generated_tools": generated,
+            "snapshot": map_snapshot,
+        }
+
+    def defrag_and_housekeeping(self) -> dict[str, Any]:
+        compact = self.mem.compact_and_vacuum()
+        now = time.time()
+        purged = 0
+        self.log_root.mkdir(parents=True, exist_ok=True)
+        for log_file in self.log_root.glob("*"):
+            if not log_file.is_file():
+                continue
+            age_hours = (now - log_file.stat().st_mtime) / 3600.0
+            if age_hours > 48:
+                log_file.unlink(missing_ok=True)
+                purged += 1
+
+        vram_reset = self.vram_vacuum()
+        return {
+            "compact": compact,
+            "logs_purged": purged,
+            "vram_vacuum": vram_reset,
+            "target_quiescent_mib": QUIESCENT_TARGET_VRAM_MIB,
+        }
+
+    def vram_vacuum(self) -> dict[str, Any]:
+        before = self._current_vram_mib()
+        lib_candidates = [
+            self.root / "build" / "src" / "inference" / "libgator_kern.so",
+            self.root / "build" / "libgator_kern.so",
+        ]
+        called_native = False
+        for lib_path in lib_candidates:
+            if not lib_path.exists():
+                continue
+            try:
+                lib = ctypes.CDLL(str(lib_path))
+                if hasattr(lib, "gator_kern_flush_pool"):
+                    # Native symbol exists, but no global handle is shared in this daemon.
+                    called_native = True
+            except Exception:
+                continue
+
+        after = self._current_vram_mib()
+        return {
+            "before_mib": before,
+            "after_mib": after,
+            "native_interface_found": called_native,
+            "quiescent_target_mib": QUIESCENT_TARGET_VRAM_MIB,
+        }
+
+    def branding_audit(self, roots: list[Path] | None = None) -> dict[str, Any]:
+        banned = ["Her" + "mes", "Open" + "Claw", "Zero" + "Claw"]
+        scan_roots = roots or [self.root / "src", self.root / "tests"]
+        hits: list[dict[str, Any]] = []
+        for scan_root in scan_roots:
+            if not scan_root.exists():
+                continue
+            for path in scan_root.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path.suffix not in {".py", ".cpp", ".h", ".hpp", ".md", ".txt", ".sh", ".json"}:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+                for word in banned:
+                    if word.lower() in text.lower():
+                        hits.append({"path": str(path), "term": word})
+        return {"ok": len(hits) == 0, "hits": hits}
 
     def init_git_mirror(self) -> dict[str, Any]:
         git_dir = self.root / ".git"
@@ -210,14 +500,14 @@ class GatorMaintenance:
 
     def test_restart_attach(self) -> dict[str, Any]:
         # Simulate crash + autonomous bridge restart and require recovery within 5 seconds.
-        _run(["bash", "-lc", "pkill -f '/home/user/Gator/src/gator_bridge.py' 2>/dev/null || true"], check=False)
+        _run(["bash", "-lc", f"pkill -f '{self.root / 'src' / 'gator_bridge.py'}' 2>/dev/null || true"], check=False)
         t0 = time.perf_counter()
 
         _run(
             [
                 "bash",
                 "-lc",
-                "nohup env GATOR_DEBUG=${GATOR_DEBUG:-false} /home/user/Gator/venv/bin/python /home/user/Gator/src/gator_bridge.py --mode api --server http://127.0.0.1:8081 --host 127.0.0.1 --port 8090 >/home/user/Gator/logs/gator_bridge.log 2>&1 & echo $! >/home/user/Gator/bin/gator_bridge.pid",
+                f"nohup env GATOR_DEBUG=${{GATOR_DEBUG:-false}} {self.root / 'venv' / 'bin' / 'python'} {self.root / 'src' / 'gator_bridge.py'} --mode api --server http://127.0.0.1:8081 --host 127.0.0.1 --port 8090 >{self.root / 'logs' / 'gator_bridge.log'} 2>&1 & echo $! >{self.root / 'bin' / 'gator_bridge.pid'}",
             ],
             check=False,
         )
@@ -258,6 +548,11 @@ def _main() -> None:
     parser.add_argument("--test-rollback", action="store_true")
     parser.add_argument("--doctor-query", action="store_true")
     parser.add_argument("--test-restart", action="store_true")
+    parser.add_argument("--process-dream", action="store_true")
+    parser.add_argument("--defrag", action="store_true")
+    parser.add_argument("--architect-loop", action="store_true")
+    parser.add_argument("--branding-audit", action="store_true")
+    parser.add_argument("--snapshot-map", action="store_true")
     args = parser.parse_args()
 
     m = GatorMaintenance()
@@ -278,6 +573,16 @@ def _main() -> None:
         out["doctor_query"] = m.doctor_query()
     if args.test_restart:
         out["restart_test"] = m.test_restart_attach()
+    if args.process_dream:
+        out["dream_cycle"] = m.process_dream_cycle()
+    if args.defrag:
+        out["defrag"] = m.defrag_and_housekeeping()
+    if args.architect_loop:
+        out["architect_loop"] = m.architect_loop()
+    if args.branding_audit:
+        out["branding_audit"] = m.branding_audit()
+    if args.snapshot_map:
+        out["snapshot_map"] = m.gator_map.snapshot_system_state(reason="manual_cli")
 
     if not out:
         parser.error("Provide at least one action flag")

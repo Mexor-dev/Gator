@@ -1,4 +1,4 @@
-#!/home/user/Gator/venv/bin/python3
+#!/usr/bin/env python3
 """Project Gator - Step 3: Direct-link LanceDB memory substrate.
 
 This module stores memories in LanceDB and generates embeddings by calling
@@ -11,20 +11,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 import uuid
+import hashlib
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any
 from urllib import error, request
 
 import lancedb
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 
-GATOR_ROOT = Path.home() / "Gator"
+GATOR_ROOT = Path(__file__).resolve().parents[1]
 DB_ROOT = GATOR_ROOT / "db"
 TABLE_NAME = "gator_memory"
+SCRATCHPAD_TABLE = "transient_scratchpad"
+SCRATCHPAD_DEFAULT_DIM = 1536  # Qwen2.5-1.5B embedding dimension
 DEFAULT_SERVER = "http://127.0.0.1:8081"
 
 
@@ -41,7 +47,10 @@ class IngestResult:
 
 
 class GatorMemoryCore:
-    def __init__(self, db_path: Path = DB_ROOT, server_url: str = DEFAULT_SERVER) -> None:
+    def __init__(self, db_path: Path | None = None, server_url: str = DEFAULT_SERVER) -> None:
+        shared_db = os.environ.get("GATOR_SHARED_DB", "").strip()
+        if db_path is None:
+            db_path = Path(shared_db) if shared_db else DB_ROOT
         self.db_path = db_path
         self.server_url = server_url.rstrip("/")
         self.db_path.mkdir(parents=True, exist_ok=True)
@@ -81,6 +90,24 @@ class GatorMemoryCore:
 
         raise MemoryCoreError("Embedding payload shape not recognized.")
 
+    def _fallback_embedding(self, text: str, dim: int = SCRATCHPAD_DEFAULT_DIM) -> list[float]:
+        vec = np.zeros(dim, dtype=np.float32)
+        tokens = re.findall(r"[A-Za-z0-9_]{2,}", text.lower())
+        if not tokens:
+            return vec.tolist()
+
+        for token in tokens:
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            idx = int.from_bytes(digest[:4], "little") % dim
+            sign = 1.0 if (digest[4] & 1) else -1.0
+            weight = 1.0 + ((digest[5] % 7) / 10.0)
+            vec[idx] += sign * weight
+
+        norm = float(np.linalg.norm(vec))
+        if norm > 1e-8:
+            vec /= norm
+        return vec.tolist()
+
     def _embed_text(self, text: str) -> tuple[list[float], str]:
         """Call llama-server embedding endpoints and return (vector, endpoint)."""
         if not text.strip():
@@ -104,6 +131,9 @@ class GatorMemoryCore:
                 last_exc = exc
                 continue
 
+        fallback = self._fallback_embedding(text)
+        if fallback:
+            return fallback, "local://lexical-hash-fallback"
         raise MemoryCoreError(f"All embedding endpoint attempts failed: {last_exc}")
 
     def _schema_for_dim(self, dim: int) -> pa.Schema:
@@ -156,6 +186,239 @@ class GatorMemoryCore:
         table = self.db.open_table(TABLE_NAME)
         return int(table.count_rows())
 
+    def flush_buffer(self, transient_tables: list[str] | None = None) -> dict[str, int]:
+        """Flush transient tables to guarantee zero-bloat next-cycle startup."""
+        table_names = set(self.db.table_names())
+        targets = transient_tables or [SCRATCHPAD_TABLE, "transient_buffer", "transient_session"]
+        deleted: dict[str, int] = {}
+        for name in targets:
+            if name not in table_names:
+                deleted[name] = 0
+                continue
+            table = self.db.open_table(name)
+            try:
+                row_count = int(table.count_rows())
+            except Exception:
+                row_count = 0
+            if row_count > 0:
+                try:
+                    table.delete("1 = 1")
+                except Exception:
+                    # Some backends are strict about predicates; overwrite as fallback.
+                    self.db.drop_table(name)
+                    table = self.db.create_table(name, data=[], mode="create")
+            deleted[name] = row_count
+        return deleted
+
+    def compact_and_vacuum(self, tables: list[str] | None = None) -> dict[str, str]:
+        """Attempt native LanceDB optimization for latency stability."""
+        table_names = set(self.db.table_names())
+        targets = tables or sorted(table_names)
+        results: dict[str, str] = {}
+        for name in targets:
+            if name not in table_names:
+                results[name] = "missing"
+                continue
+            table = self.db.open_table(name)
+            status = "noop"
+            try:
+                if hasattr(table, "optimize"):
+                    table.optimize()
+                    status = "optimized"
+                elif hasattr(table, "compact_files"):
+                    table.compact_files()
+                    status = "compacted"
+            except Exception as exc:
+                status = f"error:{exc}"
+            results[name] = status
+        return results
+
+    def chunk_research_text(
+        self,
+        text: str,
+        max_chars: int = 700,
+        overlap_chars: int = 80,
+        max_chunks: int = 6,
+    ) -> list[str]:
+        cleaned = " ".join(text.split())
+        if not cleaned:
+            return []
+
+        units = [
+            unit.strip()
+            for unit in re.split(r"(?<=[.!?])\s+|\n+", cleaned)
+            if unit.strip()
+        ]
+        if not units:
+            return [cleaned[:max_chars]]
+
+        chunks: list[str] = []
+        current = ""
+        for unit in units:
+            candidate = f"{current} {unit}".strip() if current else unit
+            if current and len(candidate) > max_chars:
+                chunks.append(current)
+                if len(chunks) >= max_chunks:
+                    break
+                overlap = current[-overlap_chars:].strip()
+                current = f"{overlap} {unit}".strip() if overlap else unit
+            else:
+                current = candidate
+        if current and len(chunks) < max_chunks:
+            chunks.append(current)
+        return chunks[:max_chunks]
+
+    def prepare_vector_snippets(
+        self,
+        text: str,
+        label: str = "",
+        focus_terms: list[str] | None = None,
+        max_snippets: int = 3,
+    ) -> list[str]:
+        chunks = self.chunk_research_text(text)
+        if not chunks:
+            return []
+
+        focus_terms = [term.lower() for term in (focus_terms or [])]
+
+        def score(chunk: str) -> tuple[int, int, int]:
+            lower = chunk.lower()
+            focus_hits = sum(lower.count(term) for term in focus_terms)
+            numeric_hits = len(re.findall(r"\b\d+(?:\.\d+)?\b", chunk))
+            return (focus_hits, numeric_hits, len(chunk))
+
+        ranked = sorted(chunks, key=score, reverse=True)[:max_snippets]
+        snippets: list[str] = []
+        for idx, chunk in enumerate(ranked, start=1):
+            prefix = f"{label} :: segment {idx}" if label else f"segment {idx}"
+            snippets.append(f"{prefix}\n{chunk}")
+        return snippets
+
+    def synthesize_research_notes(
+        self,
+        text: str,
+        label: str = "Research digest",
+        focus_terms: list[str] | None = None,
+    ) -> str:
+        snippets = self.prepare_vector_snippets(text, label=label, focus_terms=focus_terms)
+        if not snippets:
+            return label
+        bullets = [f"- {snippet.splitlines()[-1]}" for snippet in snippets]
+        return f"{label}\n" + "\n".join(bullets)
+
+    # ------------------------------------------------------------------
+    # Lance of Larger Thinking — Transient Scratchpad API
+    # ------------------------------------------------------------------
+
+    def _scratchpad_schema(self, dim: int) -> pa.Schema:
+        return pa.schema([
+            pa.field("session_id", pa.string()),
+            pa.field("step_number", pa.int32()),
+            pa.field("thought_chunk", pa.string()),
+            pa.field("vector", pa.list_(pa.float32(), dim)),
+        ])
+
+    def _open_or_create_scratchpad(self, dim: int = SCRATCHPAD_DEFAULT_DIM):
+        names = set(self.db.table_names())
+        if SCRATCHPAD_TABLE not in names:
+            schema = self._scratchpad_schema(dim)
+            return self.db.create_table(SCRATCHPAD_TABLE, schema=schema, mode="create")
+        return self.db.open_table(SCRATCHPAD_TABLE)
+
+    def init_scratchpad(self, session_id: str) -> None:
+        """Create or clear the transient buffer for a new generation session."""
+        table = self._open_or_create_scratchpad()
+        try:
+            table.delete(f"session_id = '{session_id}'")
+        except Exception:
+            pass  # Empty table on first use — no rows to delete
+
+    def commit_thought(self, session_id: str, step: int, text: str) -> None:
+        """
+        Embed and persist one intermediate reasoning chunk to the scratchpad.
+        Falls back to a zero-vector if the embedding server is unreachable so
+        the structural write always succeeds.
+        """
+        if not text.strip():
+            return
+        try:
+            vector, _ = self._embed_text(text)
+            dim = len(vector)
+        except MemoryCoreError:
+            dim = SCRATCHPAD_DEFAULT_DIM
+            vector = [0.0] * dim
+        table = self._open_or_create_scratchpad(dim)
+        row = {
+            "session_id": session_id,
+            "step_number": step,
+            "thought_chunk": text.strip(),
+            "vector": np.asarray(vector, dtype=np.float32).tolist(),
+        }
+        try:
+            table.add([row])
+        except Exception as exc:
+            raise MemoryCoreError(f"Failed writing thought to scratchpad: {exc}") from exc
+
+    def retrieve_context(self, session_id: str, current_step: int) -> str:
+        """
+        Return a formatted string of all committed reasoning steps whose
+        step_number < current_step for the given session.
+        Returns an empty string when no prior steps exist.
+        """
+        names = set(self.db.table_names())
+        if SCRATCHPAD_TABLE not in names:
+            return ""
+        table = self.db.open_table(SCRATCHPAD_TABLE)
+        try:
+            df: pd.DataFrame = table.to_pandas()
+        except Exception:
+            return ""
+        if df.empty:
+            return ""
+        mask = (df["session_id"] == session_id) & (df["step_number"] < current_step)
+        prior = df[mask].sort_values("step_number")
+        if prior.empty:
+            return ""
+        parts = [
+            f"[Step {int(row['step_number'])} Analysis]:\n{row['thought_chunk']}"
+            for _, row in prior.iterrows()
+        ]
+        return "\n\n".join(parts)
+
+    def flush_scratchpad(self, session_id: str) -> int:
+        """
+        Delete all scratchpad rows for this session and return the row count
+        that was deleted.  Must be called after successful response delivery
+        to prevent disk bloat.
+        """
+        names = set(self.db.table_names())
+        if SCRATCHPAD_TABLE not in names:
+            return 0
+        table = self.db.open_table(SCRATCHPAD_TABLE)
+        try:
+            df: pd.DataFrame = table.to_pandas()
+            count = int((df["session_id"] == session_id).sum()) if not df.empty else 0
+            if count > 0:
+                table.delete(f"session_id = '{session_id}'")
+            return count
+        except Exception as exc:
+            raise MemoryCoreError(
+                f"Failed flushing scratchpad for session {session_id!r}: {exc}"
+            ) from exc
+
+    def _scratchpad_count(self, session_id: str) -> int:
+        """Return the number of scratchpad rows for a given session. Test helper."""
+        names = set(self.db.table_names())
+        if SCRATCHPAD_TABLE not in names:
+            return 0
+        table = self.db.open_table(SCRATCHPAD_TABLE)
+        try:
+            df: pd.DataFrame = table.to_pandas()
+            if df.empty:
+                return 0
+            return int((df["session_id"] == session_id).sum())
+        except Exception:
+            return 0
 
 
 def _main() -> None:

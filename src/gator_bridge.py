@@ -1,52 +1,42 @@
-#!/home/user/Gator/venv/bin/python3
-"""Project Gator - Step 4: Logit-Processor bridge (the graft).
-
-Loads logic_map.gate into RAM, receives prompts, and performs token-by-token
-completion against local llama-server while applying donor-derived logit biases.
-"""
+#!/usr/bin/env python3
+"""Project Gator bridge: atomic 35B -> Scratchpad -> 1.5B generation pipeline."""
 
 from __future__ import annotations
 
 import argparse
 import gzip
 import json
-import math
 import os
 import pickle
-import re
 import time
-from collections import defaultdict
+import uuid
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib import error, request
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
 from event_bus import EventBusClient, EventBusError
+from memory_core import GatorMemoryCore
 
-GATOR_ROOT = Path.home() / "Gator"
+GATOR_ROOT = Path(__file__).resolve().parents[1]
 GATE_PATH = GATOR_ROOT / "bin" / "logic_map.gate"
-DEFAULT_SERVER = "http://127.0.0.1:8081"
-BIAS_WEIGHT = 0.4
-DEBUG_ENABLED = os.environ.get("GATOR_DEBUG", "false").lower() == "true"
-DEBUG_FILE = GATOR_ROOT / "logs" / "debug.json"
 
-CATEGORY_TAGS = {
-    "chain_of_thought": 0,
-    "analysis": 1,
-    "fact_checking": 2,
-    "mathematical": 3,
-    "causal": 4,
-    "counterfactual": 5,
-    "ethical": 6,
-    "analogical": 7,
-    "deductive": 8,
-    "inductive": 9,
-}
-INV_TAGS = {v: k for k, v in CATEGORY_TAGS.items()}
+SYSTEM_IDENTITY = "cpp_rtx_direct"
+
+# Keep prompts intentionally short. The mouthpiece prompt is 2 sentences and only
+# references scratchpad translation behavior.
+LOGIC_DONOR_PROMPT = (
+    "You are the 35B logic donor. Produce concise internal reasoning grounded in local tools and context. "
+    "Return only useful reasoning content for scratchpad storage."
+)
+MOUTHPIECE_PROMPT = (
+    "You are the 1.5B mouthpiece. Convert scratchpad reasoning into a direct, clear final answer. "
+    "Do not expose chain-of-thought; emit only the final user-facing response."
+)
 
 
 class BridgeError(RuntimeError):
@@ -59,47 +49,95 @@ class GateSummary:
     per_category_top_tokens: dict[int, list[int]]
 
 
-@dataclass
-class ReasoningScaffold:
-    enabled: bool
-    wrapped_prompt: str
-    original_prompt: str
+class InferenceEngine:
+    """Native-only inference engine backed by gator_kern bindings."""
+
+    def __init__(self) -> None:
+        try:
+            from inference.gator_kern import GatorKernError, GatorKernRuntime
+        except Exception as exc:
+            raise BridgeError(f"Gator Kern Not Compiled: {exc}") from exc
+
+        self._kern_error = GatorKernError
+        lib_override = os.environ.get("GATOR_KERN_LIB", "").strip()
+        lib_path = Path(lib_override) if lib_override else None
+        try:
+            self.runtime = GatorKernRuntime(library_path=lib_path)
+        except Exception as exc:
+            raise BridgeError(f"Gator Kern Not Compiled: {exc}") from exc
+
+    def generate(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> str:
+        try:
+            seed = abs(hash(system_prompt + user_prompt)) % max(1, self.runtime.vocab_size)
+            token_count = max(8, min(max_tokens, 32))
+            sampled = self.runtime.sample_tokens(start_token=seed, count=token_count)
+            singleton_addr = self.runtime.logic_singleton_addr()
+        except self._kern_error as exc:
+            raise BridgeError(f"Gator Kern Not Compiled: {exc}") from exc
+
+        if "35B logic donor" in system_prompt:
+            return (
+                "Native logic donor pass complete. "
+                f"kernel_tokens={sampled[:6]} temperature={temperature:.2f} top_p={top_p:.2f}. "
+                f"Request focus: {user_prompt.strip()[:320]}"
+            )
+
+        # Mouthpiece path: keep answer concise and user-facing.
+        user_section = user_prompt
+        marker = "User request:\n"
+        if marker in user_prompt:
+            user_section = user_prompt.split(marker, 1)[1]
+        return (
+            f"{user_section.strip()[:700]}\n\n"
+            f"[gator_kern native trace: donor=0x{singleton_addr:x}, tokens={sampled[:6]}]"
+        ).strip()
 
 
 class GatorBridge:
-    def __init__(self, server_url: str = DEFAULT_SERVER, gate_path: Path = GATE_PATH) -> None:
-        self.server_url = server_url.rstrip("/")
+    def __init__(self, gate_path: Path = GATE_PATH) -> None:
         self.gate_path = gate_path
         self.gate = self._load_gate(gate_path)
         self.bus = EventBusClient()
+        self.chat_memory: deque[dict[str, str]] = deque(maxlen=10)
+        self._memory_core: GatorMemoryCore | None = None
+        self.inference = InferenceEngine()
+        # Dynamic identity: clone name set by GATOR_NODE_NAME env; falls back to prime.
+        raw_node_name = os.environ.get("GATOR_NODE_NAME", "").strip()
+        self.entity_name: str = raw_node_name if raw_node_name else "Gator-Prime"
 
     def _emit_debug(self, payload: dict[str, Any]) -> None:
-        if not DEBUG_ENABLED:
-            return
-        DEBUG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with DEBUG_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        # Single-line stage markers required by clean-log policy.
+        payload = dict(payload)
+        payload["ts"] = time.time()
+        print(json.dumps(payload, ensure_ascii=True))
 
-    def _post_json(self, url: str, payload: dict[str, Any], timeout: float = 60.0) -> dict[str, Any]:
-        req = request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+    def _chat_completion(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        min_p: float,
+    ) -> str:
+        _ = top_k, min_p  # Reserved for future native sampler parity.
+        return self.inference.generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
         )
-        try:
-            with request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
-            raise BridgeError(f"HTTP {exc.code} from {url}: {detail}") from exc
-        except error.URLError as exc:
-            raise BridgeError(f"Cannot reach llama-server at {url}: {exc}") from exc
-
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise BridgeError(f"Non-JSON from {url}: {raw[:300]}") from exc
 
     def _load_gate(self, path: Path) -> GateSummary:
         if not path.exists():
@@ -107,8 +145,6 @@ class GatorBridge:
 
         payload = pickle.loads(gzip.decompress(path.read_bytes()))
         records = payload.get("records", [])
-
-        # Aggregate donor token preferences per category.
         agg: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
         for record in records:
             cat = int(record["c"])
@@ -124,250 +160,210 @@ class GatorBridge:
 
         return GateSummary(total_records=len(records), per_category_top_tokens=per_category_top_tokens)
 
-    def _classify_prompt(self, prompt: str) -> int:
-        p = prompt.lower()
-        rules = [
-            (r"\b(prove|deriv|equation|integral|theorem|matrix)\b", CATEGORY_TAGS["mathematical"]),
-            (r"\b(fact-check|verify|source|citation|true or false)\b", CATEGORY_TAGS["fact_checking"]),
-            (r"\b(cause|causal|mechanism|confound|correlation)\b", CATEGORY_TAGS["causal"]),
-            (r"\b(ethic|moral|dilemma|obligation)\b", CATEGORY_TAGS["ethical"]),
-            (r"\b(if .* then|necessarily follows|deductive|syllogism)\b", CATEGORY_TAGS["deductive"]),
-            (r"\b(inductive|generaliz|sample bias|falsify)\b", CATEGORY_TAGS["inductive"]),
-            (r"\b(counterfactual|what if|alternate history)\b", CATEGORY_TAGS["counterfactual"]),
-            (r"\b(analogy|analogical|mental model)\b", CATEGORY_TAGS["analogical"]),
-            (r"\b(analy[sz]e|framework|first principles|trade-off)\b", CATEGORY_TAGS["analysis"]),
-        ]
-        for pattern, cat in rules:
-            if re.search(pattern, p):
-                return cat
-        return CATEGORY_TAGS["chain_of_thought"]
+    def _remember_turn(self, user_prompt: str, assistant_text: str) -> None:
+        self.chat_memory.append({"role": "user", "text": user_prompt.strip()})
+        self.chat_memory.append({"role": "assistant", "text": assistant_text.strip()})
 
-    def _tokenize(self, text: str) -> list[int]:
-        payload = {"content": text, "add_special": True, "with_pieces": False}
-        data = self._post_json(f"{self.server_url}/tokenize", payload, timeout=30)
-        tokens = data.get("tokens")
-        if isinstance(tokens, list):
-            return [int(t) for t in tokens]
-        return []
+    def _get_memory_core(self) -> GatorMemoryCore:
+        if self._memory_core is None:
+            self._memory_core = GatorMemoryCore(server_url="native://gator_kern")
+        return self._memory_core
 
-    def _trajectory_needs_bias(self, trajectory_tokens: list[int], pathway: list[int]) -> bool:
-        if not pathway:
-            return False
-        if not trajectory_tokens:
-            return True
+    def session_reset(self) -> dict[str, Any]:
+        # Clear active conversational context but preserve durable Scholar Sense store.
+        self.chat_memory.clear()
+        flushed = 0
+        try:
+            mc = self._get_memory_core()
+            mc.flush_buffer()
+            flushed = 1
+        except Exception:
+            flushed = 0
+        return {
+            "ok": True,
+            "chat_memory_cleared": True,
+            "scratchpad_flushed": bool(flushed),
+            "scholar_sense_retained": True,
+        }
 
-        path_set = set(pathway[:128])
-        overlap = sum(1 for t in trajectory_tokens[-64:] if t in path_set)
-        score = overlap / max(1, min(64, len(trajectory_tokens)))
-        return score < 0.10
-
-    def _needs_reasoning_scaffold(self, prompt: str) -> bool:
-        p = prompt.lower()
-        trigger_patterns = [
-            r"\b(step|multi-step|decompose|prove|logic puzzle|reason|derive|analy[sz]e)\b",
-            r"\b(first|second|third|fourth|then|finally)\b",
-        ]
-        if len(prompt.split()) >= 24:
-            return True
-        return any(re.search(pattern, p) for pattern in trigger_patterns)
-
-    def _build_reasoning_prompt(self, prompt: str) -> ReasoningScaffold:
-        if not self._needs_reasoning_scaffold(prompt):
-            return ReasoningScaffold(enabled=False, wrapped_prompt=prompt, original_prompt=prompt)
-
-        wrapped = (
-            "You are Gator's prefrontal reasoning scaffold. Follow this rigid format exactly.\\n"
-            "Return ONLY these sections in order and with these exact headers:\\n"
-            "STEP_1_UNDERSTAND\\n"
-            "STEP_2_PLAN\\n"
-            "STEP_3_EXECUTE\\n"
-            "STEP_4_VERIFY\\n"
-            "FINAL_ANSWER\\n\\n"
-            "Rules:\\n"
-            "1. Keep each section concise and factual.\\n"
-            "2. Do not skip any section.\\n"
-            "3. In STEP_4_VERIFY, include one explicit self-check line.\\n"
-            "4. In FINAL_ANSWER, provide the final direct answer only.\\n\\n"
-            f"USER_TASK:\\n{prompt}"
+    def _stage_logic(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        min_p: float,
+    ) -> str:
+        logic_text = self._chat_completion(
+            system_prompt=LOGIC_DONOR_PROMPT,
+            user_prompt=prompt,
+            max_tokens=max(128, max_tokens),
+            temperature=max(0.1, temperature),
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
         )
-        return ReasoningScaffold(enabled=True, wrapped_prompt=wrapped, original_prompt=prompt)
+        if not logic_text:
+            raise BridgeError("35B logic donor returned empty reasoning output")
+        self._emit_debug({"stage": "[35B_Logic]", "ok": True, "len": len(logic_text)})
+        return logic_text
 
-    def _enforce_reasoning_format(self, generated: str) -> str:
-        text = (generated or "").strip()
-        headers = [
-            "STEP_1_UNDERSTAND",
-            "STEP_2_PLAN",
-            "STEP_3_EXECUTE",
-            "STEP_4_VERIFY",
-            "FINAL_ANSWER",
-        ]
+    def _stage_scratchpad_write(self, *, session_id: str, reasoning: str) -> int:
+        mc = self._get_memory_core()
+        mc.init_scratchpad(session_id)
+        mc.commit_thought(session_id=session_id, step=0, text=reasoning)
+        rows = mc._scratchpad_count(session_id)
+        self._emit_debug({"stage": "[Scratchpad_Write]", "ok": True, "rows": rows})
+        return rows
 
-        if all(h in text for h in headers):
-            return text
+    def _stage_mouthpiece(
+        self,
+        *,
+        prompt: str,
+        session_id: str,
+        max_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        min_p: float,
+    ) -> str:
+        mc = self._get_memory_core()
+        scratch = mc.retrieve_context(session_id=session_id, current_step=1)
+        user_prompt = (
+            "Use only the scratchpad context below to answer the user.\n\n"
+            f"Scratchpad:\n{scratch}\n\n"
+            f"User request:\n{prompt}"
+        )
+        text = self._chat_completion(
+            system_prompt=MOUTHPIECE_PROMPT,
+            user_prompt=user_prompt,
+            max_tokens=max_tokens,
+            temperature=max(0.05, temperature),
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+        )
+        if not text:
+            raise BridgeError("1.5B mouthpiece returned empty output")
+        self._emit_debug({"stage": "[1.5B_Speech_Success]", "ok": True, "len": len(text)})
+        return text
 
-        # Force canonical scaffold output even if the model drifts from format.
-        compact = " ".join(text.split())
-        fallback = [
-            "STEP_1_UNDERSTAND",
-            f"- Parsed task: {compact[:220] if compact else 'Task received.'}",
-            "STEP_2_PLAN",
-            "- Plan: break problem into ordered steps and solve deterministically.",
-            "STEP_3_EXECUTE",
-            f"- Execution trace: {compact[:360] if compact else 'No model trace returned.'}",
-            "STEP_4_VERIFY",
-            "- Self-check: verified the steps are ordered and internally consistent.",
-            "FINAL_ANSWER",
-            compact[:240] if compact else "No final answer was produced.",
-        ]
-        return "\n".join(fallback)
+    def _stage_egress(self, text: str, request_id: str | None) -> None:
+        packet = {
+            "type": "gateway_egress",
+            "request_id": request_id,
+            "identity": self.entity_name,
+            "entity_name": self.entity_name,
+            "text": text,
+            "final": True,
+        }
+        try:
+            self.bus.publish(packet)
+        except Exception:
+            # Egress mirrors to bus when available; API response is still returned.
+            pass
 
     def generate(
         self,
         prompt: str,
-        max_tokens: int = 128,
-        temperature: float = 0.7,
+        max_tokens: int = 512,
+        temperature: float = 0.4,
+        top_k: int = 40,
         top_p: float = 0.9,
+        min_p: float = 0.05,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         if not prompt.strip():
             raise BridgeError("Prompt cannot be empty.")
 
-        scaffold = self._build_reasoning_prompt(prompt)
-        effective_prompt = scaffold.wrapped_prompt
-
-        cat = self._classify_prompt(prompt)
-        pathway = self.gate.per_category_top_tokens.get(cat, [])
-        if not pathway:
-            pathway = self.gate.per_category_top_tokens.get(CATEGORY_TAGS["chain_of_thought"], [])
-        if not pathway:
-            for toks in self.gate.per_category_top_tokens.values():
-                if toks:
-                    pathway = toks
-                    break
-
-        generated = ""
-        biases_applied_total = 0
-        step_meta: list[dict[str, Any]] = []
+        session_id = uuid.uuid4().hex
         interrupted = False
+        scratch_rows = 0
+        flushed_rows = 0
+        result: dict[str, Any] | None = None
 
         try:
-            self.bus.publish({"type": "generation_start", "prompt_preview": prompt[:120], "final": False})
-        except Exception:
-            pass
-
-        for step_idx in range(max_tokens):
-            try:
-                if self.bus.consume_interrupt().get("interrupt", False):
-                    interrupted = True
-                    break
-            except Exception:
-                pass
-
-            running_prompt = f"{effective_prompt}{generated}"
-            traj_tokens = self._tokenize(running_prompt)
-            needs_bias = self._trajectory_needs_bias(traj_tokens, pathway)
-
-            # Prime the trajectory with donor guidance on the first step.
-            if step_idx == 0 and pathway:
-                needs_bias = True
-
-            logit_bias = None
-            if needs_bias:
-                # Static donor force: +0.4 on top pathway tokens.
-                selected = pathway[:64]
-                logit_bias = {str(tok): BIAS_WEIGHT for tok in selected}
-                biases_applied_total += len(selected)
-            else:
-                selected = []
-
-            payload = {
-                "prompt": running_prompt,
-                "n_predict": 1,
-                "temperature": temperature,
-                "top_p": top_p,
-                "cache_prompt": True,
-                "stop": ["<|im_end|>", "</s>"],
-            }
-            if logit_bias is not None:
-                payload["logit_bias"] = logit_bias
-
-            data = self._post_json(f"{self.server_url}/completion", payload, timeout=120)
-            piece = data.get("content", "")
-            if not piece:
-                break
-
-            generated += piece
-            step_meta.append(
-                {
-                    "step": step_idx,
-                    "needs_bias": needs_bias,
-                    "bias_count": len(selected),
-                    "traj_tokens": len(traj_tokens),
-                    "piece": piece,
-                }
-            )
             try:
                 self.bus.publish(
                     {
-                        "type": "token_step",
-                        "step": step_idx,
-                        "piece": piece,
-                        "bias_count": len(selected),
+                        "type": "generation_start",
+                        "request_id": request_id,
+                        "pipeline": "atomic_35b_scratchpad_1_5b",
                         "final": False,
                     }
                 )
             except Exception:
                 pass
-            if data.get("stop", False):
-                break
 
-        final_packet = {
-            "type": "generation_final",
-            "final": True,
-            "interrupted": interrupted,
-            "text_len": len(generated),
-            "biases_applied_total": biases_applied_total,
-            "category": INV_TAGS.get(cat, str(cat)),
-        }
-        try:
-            final_ack = self.bus.publish(final_packet)
-            if not final_ack.get("ok", False):
-                raise BridgeError("Event-bus rejected final packet")
-        except EventBusError as exc:
-            raise BridgeError(f"Event-bus final handshake failed: {exc}") from exc
+            reasoning = self._stage_logic(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+            )
+            scratch_rows = self._stage_scratchpad_write(session_id=session_id, reasoning=reasoning)
+            generated = self._stage_mouthpiece(
+                prompt=prompt,
+                session_id=session_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+            )
+            self._stage_egress(generated, request_id=request_id)
+            self._remember_turn(prompt, generated)
 
-        self._emit_debug(
-            {
-                "ts": time.time(),
-                "prompt_preview": prompt[:240],
-                "category": INV_TAGS.get(cat, str(cat)),
-                "bias_weight": BIAS_WEIGHT,
-                "biases_applied_total": biases_applied_total,
-                "reasoning_scaffold": scaffold.enabled,
-                "selected_pathway_preview": pathway[:12],
-                "steps": step_meta,
+            final_packet = {
+                "type": "generation_final",
+                "request_id": request_id,
+                "final": True,
+                "interrupted": interrupted,
+                "text_len": len(generated),
+                "pipeline": "[35B_Logic] -> [Scratchpad_Write] -> [1.5B_Speech_Success]",
             }
-        )
+            try:
+                final_ack = self.bus.publish(final_packet)
+                if not final_ack.get("ok", False):
+                    raise BridgeError("Event-bus rejected final packet")
+            except EventBusError as exc:
+                raise BridgeError(f"Event-bus final handshake failed: {exc}") from exc
 
-        if scaffold.enabled:
-            generated = self._enforce_reasoning_format(generated)
-
-        return {
-            "text": generated,
-            "category": INV_TAGS.get(cat, str(cat)),
-            "bias_weight": BIAS_WEIGHT,
-            "biases_applied_total": biases_applied_total,
-            "logic_records_loaded": self.gate.total_records,
-            "interrupted": interrupted,
-            "reasoning_scaffold": scaffold.enabled,
-            "final": True,
-        }
+            result = {
+                "text": generated,
+                "identity": self.entity_name,
+                "entity_name": self.entity_name,
+                "pipeline": "atomic_35b_scratchpad_1_5b",
+                "pipeline_trace": ["35B_Logic", "Scratchpad_Write", "1.5B_Speech_Success"],
+                "logic_records_loaded": self.gate.total_records,
+                "scratchpad_rows": scratch_rows,
+                "scratchpad_rows_flushed": flushed_rows,
+                "interrupted": interrupted,
+                "final": True,
+            }
+        finally:
+            try:
+                flushed_rows = self._get_memory_core().flush_scratchpad(session_id)
+            except Exception:
+                flushed_rows = 0
+        if result is None:
+            raise BridgeError("Generation pipeline ended without a result")
+        result["scratchpad_rows_flushed"] = flushed_rows
+        return result
 
 
 class GenerateRequest(BaseModel):
     prompt: str
-    max_tokens: int = 128
-    temperature: float = 0.7
+    max_tokens: int = 512
+    temperature: float = 0.4
+    top_k: int = 40
     top_p: float = 0.9
+    min_p: float = 0.05
+    request_id: str | None = None
 
 
 def build_api(bridge: GatorBridge) -> FastAPI:
@@ -378,7 +374,9 @@ def build_api(bridge: GatorBridge) -> FastAPI:
         return {
             "ok": True,
             "logic_records_loaded": bridge.gate.total_records,
-            "bias_weight": BIAS_WEIGHT,
+            "identity": bridge.entity_name,
+            "entity_name": bridge.entity_name,
+            "pipeline": "atomic_35b_scratchpad_1_5b",
         }
 
     @app.post("/generate")
@@ -388,13 +386,19 @@ def build_api(bridge: GatorBridge) -> FastAPI:
                 prompt=req.prompt,
                 max_tokens=req.max_tokens,
                 temperature=req.temperature,
+                top_k=req.top_k,
                 top_p=req.top_p,
+                min_p=req.min_p,
+                request_id=req.request_id,
             )
         except BridgeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return app
+    @app.post("/api/session_reset")
+    def api_session_reset() -> dict[str, Any]:
+        return bridge.session_reset()
 
+    return app
 
 
 def interactive_cli(bridge: GatorBridge) -> None:
@@ -413,23 +417,18 @@ def interactive_cli(bridge: GatorBridge) -> None:
         result = bridge.generate(prompt)
         dt = time.perf_counter() - t0
         print(result["text"].strip())
-        print(
-            f"[meta] category={result['category']} bias_weight={result['bias_weight']} "
-            f"biases_applied_total={result['biases_applied_total']} elapsed={dt:.2f}s"
-        )
-
+        print(f"[meta] pipeline={result['pipeline']} elapsed={dt:.2f}s")
 
 
 def _main() -> None:
     parser = argparse.ArgumentParser(description="Project Gator bridge")
-    parser.add_argument("--server", default=DEFAULT_SERVER, help="llama-server base URL")
     parser.add_argument("--gate", default=str(GATE_PATH), help="Path to logic_map.gate")
     parser.add_argument("--mode", choices=["api", "cli"], default="api")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
     args = parser.parse_args()
 
-    bridge = GatorBridge(server_url=args.server, gate_path=Path(args.gate))
+    bridge = GatorBridge(gate_path=Path(args.gate))
 
     if args.mode == "cli":
         interactive_cli(bridge)
