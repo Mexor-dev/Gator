@@ -43,6 +43,7 @@ TG_PID_FILE = GATOR_ROOT / "bin" / "telegram_gateway.pid"  # shared: wakeup writ
 TG_LOG_FILE = GATOR_ROOT / "logs" / "telegram_hive.log"
 TG_STATUS_FILE = GATOR_ROOT / "logs" / "telegram_hive_status.json"
 INGEST_STATUS_FILE = GATOR_ROOT / "logs" / "ingest_status.json"
+VOICE_STATUS_FILE = GATOR_ROOT / "logs" / "voice_status.json"
 PRIME_BRIDGE_URL = os.environ.get("PRIME_BRIDGE_URL", "http://127.0.0.1:8090")
 
 app = FastAPI(title="Gator Surgical Lab", version="1.0")
@@ -70,6 +71,24 @@ def _get_ingest_status() -> dict[str, Any]:
     return json.loads(INGEST_STATUS_FILE.read_text(encoding="utf-8"))
   except Exception:
     return {"state": "error", "percent": 0, "detail": {"reason": "status_parse_failed"}, "updated_at": time.time()}
+
+
+def _get_voice_status() -> dict[str, Any]:
+  """Read current voice enablement status from disk."""
+  if not VOICE_STATUS_FILE.exists():
+    return {"enabled": True, "updated_at": time.time()}
+  try:
+    return json.loads(VOICE_STATUS_FILE.read_text(encoding="utf-8"))
+  except Exception:
+    return {"enabled": True, "updated_at": time.time()}
+
+
+def _set_voice_status(enabled: bool) -> dict[str, Any]:
+  """Write voice enablement status to disk."""
+  payload = {"enabled": enabled, "updated_at": time.time()}
+  VOICE_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+  VOICE_STATUS_FILE.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+  return payload
 
 
 def _ingest_worker(pdf_path: str, job_id: str) -> None:
@@ -728,6 +747,26 @@ def htmx_greenlight() -> str:
   )
 
 
+@app.get("/api/voice/status")
+def get_voice_status() -> dict[str, Any]:
+  """Get current voice chat status."""
+  return _get_voice_status()
+
+
+@app.post("/api/voice/on")
+def voice_on() -> dict[str, Any]:
+  """Enable voice chat (Piper TTS + Whisper STT in Telegram)."""
+  status = _set_voice_status(True)
+  return {"ok": True, **status}
+
+
+@app.post("/api/voice/off")
+def voice_off() -> dict[str, Any]:
+  """Disable voice chat to free VRAM resources."""
+  status = _set_voice_status(False)
+  return {"ok": True, **status}
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     graph_url = "/graph" if GRAPH_HTML.exists() else ""
@@ -786,6 +825,8 @@ def index() -> str:
         <button hx-post="/api/interrupt"
                 hx-swap="none"
                 hx-on::after-request="alert('Interrupt sent')">Interrupt</button>
+        <button id="voiceOnBtn" style="background:#1b6b3a">🎙️ Voice ON</button>
+        <button id="voiceOffBtn" style="background:#8b1f2a">🔇 Voice OFF</button>
         <button id="setupTelegramBtn">⚙️ Setup Telegram</button>
         <button id="mitosisBtn"
                 title="Spawn a 35B Worker clone (capped at 2228 MiB VRAM, 6x density)"
@@ -1033,6 +1074,39 @@ def index() -> str:
       await fetch(enabled ? '/api/cron/start' : '/api/cron/stop', {{ method: 'POST' }});
       htmx.trigger(document.getElementById('cronBody'), 'load');
     }}
+
+    // ── Voice chat on/off ───────────────────────────────────────
+    async function setVoiceEnabled(enabled) {{
+      const endpoint = enabled ? '/api/voice/on' : '/api/voice/off';
+      try {{
+        const r = await fetch(endpoint, {{ method: 'POST' }});
+        const d = await r.json();
+        if (d.ok) {{
+          const msg = enabled ? 'Voice chat enabled (Piper TTS + Whisper STT)' : 'Voice chat disabled (freed VRAM)';
+          alert(msg);
+          updateVoiceButtonStates();
+        }}
+      }} catch (err) {{
+        alert('Voice toggle error: ' + String(err));
+      }}
+    }}
+
+    async function updateVoiceButtonStates() {{
+      try {{
+        const r = await fetch('/api/voice/status');
+        const d = await r.json();
+        document.getElementById('voiceOnBtn').style.opacity = d.enabled ? '1' : '0.5';
+        document.getElementById('voiceOffBtn').style.opacity = d.enabled ? '0.5' : '1';
+      }} catch (err) {{
+        console.error('Voice status update failed:', err);
+      }}
+    }}
+
+    document.getElementById('voiceOnBtn').addEventListener('click', () => setVoiceEnabled(true));
+    document.getElementById('voiceOffBtn').addEventListener('click', () => setVoiceEnabled(false));
+
+    // Initialize voice button states
+    document.addEventListener('DOMContentLoaded', updateVoiceButtonStates);
 
     // ── Ingest bar (JS-driven for CSS width animation) ─────────
     let lastGraphRefreshTs = 0;

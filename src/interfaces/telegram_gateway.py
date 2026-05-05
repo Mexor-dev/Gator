@@ -36,6 +36,7 @@ PIPER_ESPEAK_DATA = PIPER_RUNTIME_DIR / "espeak-ng-data"
 PIPER_MODEL = GATOR_ROOT / "models" / "tts" / "en_GB-alba-medium.onnx"
 PIPER_MODEL_CONFIG = GATOR_ROOT / "models" / "tts" / "en_GB-alba-medium.onnx.json"
 TTS_TMP_DIR = GATOR_ROOT / "tmp" / "tts"
+VOICE_STATUS_FILE = GATOR_ROOT / "logs" / "voice_status.json"
 STOP = False
 NATIVE_LOG = GATOR_ROOT / "logs" / "native.log"
 _TRACE_PAT = re.compile(r"\[gator_kern native trace:[^\]]*\]")
@@ -73,6 +74,17 @@ def _sleep_with_stop(seconds: float) -> None:
     end = time.time() + max(0.0, seconds)
     while not STOP and time.time() < end:
         time.sleep(0.2)
+
+
+def _get_voice_enabled_from_file() -> bool:
+    """Read voice enablement status from file; default to True if not found."""
+    try:
+        if VOICE_STATUS_FILE.exists():
+            data = json.loads(VOICE_STATUS_FILE.read_text(encoding="utf-8"))
+            return bool(data.get("enabled", True))
+    except Exception:
+        pass
+    return True
 
 
 def _resolve_with_public_dns(host: str) -> list[str]:
@@ -135,7 +147,7 @@ class TelegramGateway:
         self.username = username
         self.auth_chat_id = str(auth_chat_id)
         self.bridge_url = bridge_url
-        self.voice_enabled = True
+        self.voice_enabled = _get_voice_enabled_from_file()
 
     async def _ask_gator(self, text: str) -> tuple[str, str, bool]:
         request_id = uuid.uuid4().hex
