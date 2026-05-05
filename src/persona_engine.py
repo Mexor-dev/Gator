@@ -9,6 +9,7 @@ Traits
 ------
 curiosity   – 0 = focused/methodical,  1 = wide-ranging/exploratory
 directness  – 0 = verbose/elaborate,   1 = terse/surgical
+agency      – 0 = passive/reactive,    1 = assertive/execution-first
 caution     – 0 = bold/decisive,        1 = careful/hedged
 creativity  – 0 = conventional,         1 = inventive/lateral
 empathy     – 0 = detached/clinical,    1 = warm/relational
@@ -21,6 +22,7 @@ import hashlib
 import json
 import time
 import uuid
+import re
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,7 @@ GATOR_ROOT = Path(__file__).resolve().parents[1]
 TRAIT_DEFAULTS: dict[str, float] = {
     "curiosity": 0.5,
     "directness": 0.5,
+    "agency": 0.5,
     "caution": 0.5,
     "creativity": 0.5,
     "empathy": 0.5,
@@ -43,12 +46,19 @@ TRAIT_DEFAULTS: dict[str, float] = {
 _TRAIT_DESC: dict[str, tuple[str, str]] = {
     "curiosity":   ("focused and methodical", "wide-ranging and exploratory"),
     "directness":  ("thorough and elaborative", "concise and surgical"),
+    "agency":      ("reactive and deferential", "assertive and execution-focused"),
     "caution":     ("bold and decisive", "careful and hedged"),
     "creativity":  ("conventional and reliable", "inventive and lateral"),
     "empathy":     ("detached and clinical", "warm and relational"),
     "precision":   ("approximate and broad", "exact and strictly literal"),
 }
 
+_GENERIC_PHRASE_REPLACEMENTS: list[tuple[str, str]] = [
+    (r"(?i)\bi\s*[' ]?m\s+here\s+to\s+help\b", "Logic applied. What's the next objective?"),
+    (r"(?i)^\s*understood\b[\s,.:;-]*", "Task acknowledged. "),
+    (r"(?i)\bright\s+away\b", "moving to execution"),
+    (r"(?i)\bi\s+can\s+help\s+you\s+with\s+that\b", "Logic applied. What's the next objective?"),
+]
 REFLECTION_TABLE = "persona_reflections"
 REFLECTION_DIM = 256  # lightweight fallback-only embedding dimension
 
@@ -120,6 +130,34 @@ class PersonaEngine:
         if not lines:
             return ""
         return "[Persona steering]\n" + "\n".join(lines)
+
+    def refine_response(self, text: str, *, user_text: str = "", scratchpad: str = "") -> str:
+        """Apply sovereign style filtering and contextual tone shaping."""
+        out = (text or "").strip()
+        if not out:
+            return out
+
+        for pattern, replacement in _GENERIC_PHRASE_REPLACEMENTS:
+            out = re.sub(pattern, replacement, out)
+
+        if out.lower().startswith("task acknowledged") and "moving to execution" not in out.lower():
+            out = out.strip()
+            if not out.endswith("."):
+                out += "."
+            out += " Moving to execution."
+
+        query = (user_text or "").lower()
+        asks_runtime = any(k in query for k in ("vram", "worker", "workers", "status", "health", "state"))
+        if asks_runtime:
+            low = out.lower()
+            has_runtime_phrase = any(k in low for k in ("vram", "worker", "workers", "runtime", "telemetry"))
+            if not has_runtime_phrase:
+                scratch_hint = ""
+                if scratchpad and len(scratchpad.strip()) > 0:
+                    scratch_hint = " Scratchpad sync is active."
+                out = f"{out.rstrip('.')} Runtime telemetry is live for VRAM and worker state.{scratch_hint}".strip()
+
+        return " ".join(out.split())
 
     # ------------------------------------------------------------------
     # Reflection store

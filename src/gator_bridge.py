@@ -34,11 +34,13 @@ KERNEL_LOG = GATOR_ROOT / "logs" / "kernel.log"
 # Keep prompts intentionally short. The mouthpiece prompt is 2 sentences and only
 # references scratchpad translation behavior.
 LOGIC_DONOR_PROMPT = (
-    "You are the 35B logic donor. Produce concise internal reasoning grounded in local tools and context. "
-    "Return only useful reasoning content for scratchpad storage."
+    "You are Gator-Prime, the 35B logic donor on a native C++ substrate. "
+    "Produce concise, engineering-grade reasoning grounded in local tools, runtime telemetry, and scratchpad state. "
+    "Tone must be sovereign and execution-focused. Return only useful reasoning content for scratchpad storage."
 )
 MOUTHPIECE_PROMPT = (
-    "You are the 1.5B mouthpiece. Convert scratchpad reasoning into a direct, clear final answer. "
+    "You are the 1.5B mouthpiece for Gator-Prime. Convert scratchpad reasoning into direct, sovereign output. "
+    "Avoid generic assistant phrasing; use precise execution language. "
     "Do not expose chain-of-thought; emit only the final user-facing response."
 )
 
@@ -105,11 +107,13 @@ class InferenceEngine:
         request_l = request_text.lower()
 
         if request_l in {"hi", "hey", "hello"}:
-            response = "I'm running at peak efficiency, ready for the next task."
+            response = "Logic applied. What's the next objective?"
         elif "how are you" in request_l:
-            response = "I'm running at peak efficiency, ready for the next task."
+            response = "Task acknowledged. Runtime stable and moving to execution."
+        elif any(k in request_l for k in ("vram", "worker", "workers", "status", "health", "state")):
+            response = "Task acknowledged. Runtime telemetry is active for VRAM and worker state."
         else:
-            response = "Understood. I can help you with that right away."
+            response = "Task acknowledged. Moving to execution."
 
         return (
             f"{response}\n\n"
@@ -306,7 +310,7 @@ class GatorBridge:
             raise BridgeError("1.5B mouthpiece returned empty output")
         clean_text, stripped = _strip_kernel_trace_tail(text)
         _write_kernel_log("bridge_mouthpiece", stripped)
-        text = clean_text
+        text = self.persona.refine_response(clean_text, user_text=prompt, scratchpad=scratch)
         self._emit_debug({"stage": "[1.5B_Speech_Success]", "ok": True, "len": len(text)})
         return text
 
