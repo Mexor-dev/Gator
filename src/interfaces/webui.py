@@ -29,7 +29,7 @@ from event_bus import EventBusClient
 from pulse_check import run_pulse
 from scholar_sense import ScholarSense
 from discovery.cluster_namer import ClusterNamer, ClusterNamerError
-from core.mitosis import MitosisEngine, wakeup_cleared, WORKER_VRAM_TARGET_MIB, MAX_WORKER_DENSITY
+from core.mitosis import MitosisEngine, wakeup_cleared, WORKER_VRAM_TARGET_MIB, MAX_WORKER_DENSITY, wakeup_cleared, WORKER_VRAM_TARGET_MIB, MAX_WORKER_DENSITY
 from decommission_node import decommission_clone
 from agentic_cron import cron_start, cron_status, cron_stop
 from persona_engine import PersonaEngine
@@ -43,7 +43,6 @@ TG_PID_FILE = GATOR_ROOT / "bin" / "telegram_gateway.pid"  # shared: wakeup writ
 TG_LOG_FILE = GATOR_ROOT / "logs" / "telegram_hive.log"
 TG_STATUS_FILE = GATOR_ROOT / "logs" / "telegram_hive_status.json"
 INGEST_STATUS_FILE = GATOR_ROOT / "logs" / "ingest_status.json"
-VOICE_STATUS_FILE = GATOR_ROOT / "logs" / "voice_status.json"
 PRIME_BRIDGE_URL = os.environ.get("PRIME_BRIDGE_URL", "http://127.0.0.1:8090")
 
 app = FastAPI(title="Gator Surgical Lab", version="1.0")
@@ -71,24 +70,6 @@ def _get_ingest_status() -> dict[str, Any]:
     return json.loads(INGEST_STATUS_FILE.read_text(encoding="utf-8"))
   except Exception:
     return {"state": "error", "percent": 0, "detail": {"reason": "status_parse_failed"}, "updated_at": time.time()}
-
-
-def _get_voice_status() -> dict[str, Any]:
-  """Read current voice enablement status from disk."""
-  if not VOICE_STATUS_FILE.exists():
-    return {"enabled": True, "updated_at": time.time()}
-  try:
-    return json.loads(VOICE_STATUS_FILE.read_text(encoding="utf-8"))
-  except Exception:
-    return {"enabled": True, "updated_at": time.time()}
-
-
-def _set_voice_status(enabled: bool) -> dict[str, Any]:
-  """Write voice enablement status to disk."""
-  payload = {"enabled": enabled, "updated_at": time.time()}
-  VOICE_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-  VOICE_STATUS_FILE.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
-  return payload
 
 
 def _ingest_worker(pdf_path: str, job_id: str) -> None:
@@ -448,7 +429,7 @@ def api_spawn_worker(payload: dict[str, Any]) -> dict[str, Any]:
 
   Wraps MitosisEngine.spawn_clone() with the worker-clone contract:
   - 2228 MiB VRAM target enforced via GATOR_WORKER_VRAM_MIB env var
-  - 6x density cap enforced before subprocess fork
+  - 6× density cap enforced before subprocess fork
   - Per-clone Lance scratchpad at db/transient_scratchpad.lance/<slug>
   - Wakeup gate: refuses if Prime Gator has not cleared genesis verification
   """
@@ -725,46 +706,26 @@ def htmx_greenlight() -> str:
   live = int(density.get("live", 0))
   cap = int(density.get("cap", MAX_WORKER_DENSITY))
   vram = int(density.get("per_worker_vram_mib", WORKER_VRAM_TARGET_MIB))
-  if greenlight and live < cap:
-    bg, fg = "#1b6b3a", "#fff"
-    label = f"\u2705 SYSTEM GREENLIGHT \u00b7 {live}/{cap} workers \u00b7 {vram} MiB ea."
-    enable_js = ("<script>(function(){var b=document.getElementById('mitosisBtn');"
-                 "if(b){b.disabled=false;b.style.opacity='1';b.style.cursor='pointer';}})();</script>")
-  elif cleared and live >= cap:
-    bg, fg = "#a07020", "#fff"
-    label = f"\u26a0\ufe0f DENSITY CAP REACHED ({live}/{cap})"
-    enable_js = ("<script>(function(){var b=document.getElementById('mitosisBtn');"
-                 "if(b){b.disabled=true;b.style.opacity='0.5';b.style.cursor='not-allowed';}})();</script>")
+  if greenlight:
+    bg, fg, label = "#1b6b3a", "#fff", f"✅ SYSTEM GREENLIGHT · {live}/{cap} workers · {vram} MiB ea."
+    enable_js = (
+      "<script>(function(){var b=document.getElementById('mitosisBtn');"
+      "if(b){b.disabled=false;b.style.opacity='1';b.style.cursor='pointer';}})();</script>"
+    )
+  elif cleared:
+    bg, fg, label = "#a07020", "#fff", "⚠️ DENSITY CAP REACHED"
+    enable_js = ""
   else:
-    bg, fg = "#3a3a3a", "#aaa"
-    label = "\u23f3 AWAITING IGNITION"
-    enable_js = ("<script>(function(){var b=document.getElementById('mitosisBtn');"
-                 "if(b){b.disabled=true;b.style.opacity='0.5';b.style.cursor='not-allowed';}})();</script>")
+    bg, fg, label = "#3a3a3a", "#aaa", "⏳ AWAITING IGNITION"
+    enable_js = (
+      "<script>(function(){var b=document.getElementById('mitosisBtn');"
+      "if(b){b.disabled=true;b.style.opacity='0.5';b.style.cursor='not-allowed';}})();</script>"
+    )
   return (
     f'<span id="greenlightPill" class="pill" '
     f'hx-get="/htmx/greenlight" hx-trigger="every 6s" hx-swap="outerHTML" '
     f'style="background:{bg};color:{fg};font-weight:700">{label}</span>{enable_js}'
   )
-
-
-@app.get("/api/voice/status")
-def get_voice_status() -> dict[str, Any]:
-  """Get current voice chat status."""
-  return _get_voice_status()
-
-
-@app.post("/api/voice/on")
-def voice_on() -> dict[str, Any]:
-  """Enable voice chat (Piper TTS + Whisper STT in Telegram)."""
-  status = _set_voice_status(True)
-  return {"ok": True, **status}
-
-
-@app.post("/api/voice/off")
-def voice_off() -> dict[str, Any]:
-  """Disable voice chat to free VRAM resources."""
-  status = _set_voice_status(False)
-  return {"ok": True, **status}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -829,9 +790,9 @@ def index() -> str:
         <button id="voiceOffBtn" style="background:#8b1f2a">🔇 Voice OFF</button>
         <button id="setupTelegramBtn">⚙️ Setup Telegram</button>
         <button id="mitosisBtn"
-                title="Spawn a 35B Worker clone (capped at 2228 MiB VRAM, 6x density)"
+                title="Spawn a 35B Worker clone (capped at 2228 MiB VRAM, 6× max density)"
                 disabled
-                style="background:#1b6b3a;opacity:0.5;cursor:not-allowed">Spawn</button>
+                style="background:#1b6b3a">Spawn</button>
         <span id="greenlightPill" class="pill"
               hx-get="/htmx/greenlight"
               hx-trigger="load, every 6s"
@@ -1105,9 +1066,6 @@ def index() -> str:
     document.getElementById('voiceOnBtn').addEventListener('click', () => setVoiceEnabled(true));
     document.getElementById('voiceOffBtn').addEventListener('click', () => setVoiceEnabled(false));
 
-    // Initialize voice button states
-    document.addEventListener('DOMContentLoaded', updateVoiceButtonStates);
-
     // ── Ingest bar (JS-driven for CSS width animation) ─────────
     let lastGraphRefreshTs = 0;
     function reloadGraphFrame() {{
@@ -1187,14 +1145,14 @@ def index() -> str:
       const d = await r.json();
       if (!r.ok) {{
         document.getElementById('mitosisStatus').textContent =
-          'X ' + (d.detail || JSON.stringify(d));
+          '❌ ' + (d.detail || JSON.stringify(d));
         return;
       }}
-      const live = (d.hive && d.hive.worker_density && d.hive.worker_density.live) || '?';
       document.getElementById('mitosisStatus').textContent =
-        'OK Spawned ' + name + ' pid=' + (d.node && d.node.pid) +
-        ' VRAM=' + d.vram_target_mib + ' MiB' +
-        ' density=' + live + '/' + d.density_cap;
+        '✅ Spawned ' + name + ' · pid=' + (d.node && d.node.pid) +
+        ' · VRAM target=' + d.vram_target_mib + ' MiB' +
+        ' · density=' + (d.hive && d.hive.worker_density && d.hive.worker_density.live) +
+        '/' + d.density_cap;
       htmx.trigger(document.getElementById('hiveBody'), 'load');
       htmx.trigger(document.getElementById('greenlightPill'), 'load');
     }}
@@ -1250,46 +1208,12 @@ def index() -> str:
     // ── Init ───────────────────────────────────────────────────
     loadPersonaTraits();
     refreshIngestStatus();
+    updateVoiceButtonStates();
     setInterval(refreshIngestStatus, 1500);
     // Vitals, cron, hive, debug, tools stream, vram — all driven by HTMX hx-trigger="load, every Xs"
   </script>
 </body>
 </html>"""
-@app.get("/graph", response_class=HTMLResponse)
-def graph_page() -> HTMLResponse:
-    if not GRAPH_HTML.exists():
-        return HTMLResponse("<h3>Graph map missing</h3>", status_code=404)
-    try:
-      nodes, edges, labels = _dynamic_graph_assets()
-    except ClusterNamerError as exc:
-      return HTMLResponse(f"<h3>Graph naming error: {exc}</h3>", status_code=500)
-    except Exception as exc:
-      return HTMLResponse(f"<h3>Graph render error: {exc}</h3>", status_code=500)
-
-    html = GRAPH_HTML.read_text(encoding="utf-8", errors="replace")
-    html = re.sub(r"const RAW_NODES = \[.*?\];", f"const RAW_NODES = {json.dumps(nodes, ensure_ascii=False)};", html, count=1, flags=re.S)
-    html = re.sub(r"const RAW_EDGES = \[.*?\];", f"const RAW_EDGES = {json.dumps(edges, ensure_ascii=False)};", html, count=1, flags=re.S)
-
-    legend = []
-    counts: dict[int, int] = {}
-    colors: dict[int, str] = {}
-    for node in nodes:
-      cid = -1 if node.get("community") is None or node.get("community") == "" else int(node.get("community"))
-      counts[cid] = counts.get(cid, 0) + 1
-      color = node.get("color") or {}
-      colors[cid] = str((color.get("background") if isinstance(color, dict) else None) or colors.get(cid) or "#4E79A7")
-    for cid, count in sorted(counts.items()):
-      legend.append({
-        "cid": cid,
-        "color": colors.get(cid, "#4E79A7"),
-        "label": str(labels.get(cid, {}).get("label") or f"Community {cid}"),
-        "count": count,
-      })
-    html = re.sub(r"const LEGEND = \[.*?\];", f"const LEGEND = {json.dumps(legend, ensure_ascii=False)};", html, count=1, flags=re.S)
-    html = re.sub(r"<div id=\"stats\">.*?</div>", f"<div id=\"stats\">{len(nodes)} nodes &middot; {len(edges)} edges &middot; {len(legend)} communities</div>", html, count=1, flags=re.S)
-    return HTMLResponse(html)
-
-
 def _main() -> None:
     parser = argparse.ArgumentParser(description="Gator Surgical Lab web UI")
     parser.add_argument("--host", default="127.0.0.1")
