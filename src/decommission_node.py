@@ -136,6 +136,24 @@ def decommission_clone(clone_name: str) -> dict[str, Any]:
         _save_state(state)
         result["operations"].append({"op": "update_hive_state", "status": "removed"})
 
+    # Step 4: Cleanup the per-clone Lance scratchpad namespace
+    # (transient context exchange - safe to remove on decommission).
+    scratchpad = clone_entry.get("lance_scratchpad")
+    if scratchpad:
+        sp = Path(scratchpad)
+        try:
+            if sp.exists():
+                import shutil
+                shutil.rmtree(sp)
+                result["operations"].append({
+                    "op": "drop_scratchpad", "path": str(sp), "status": "ok"
+                })
+        except Exception as exc:
+            result["operations"].append({
+                "op": "drop_scratchpad", "path": str(sp), "status": "error",
+                "error": str(exc),
+            })
+
     result["hive_after"] = state
 
     return result

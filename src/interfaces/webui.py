@@ -29,7 +29,7 @@ from event_bus import EventBusClient
 from pulse_check import run_pulse
 from scholar_sense import ScholarSense
 from discovery.cluster_namer import ClusterNamer, ClusterNamerError
-from core.mitosis import MitosisEngine
+from core.mitosis import MitosisEngine, wakeup_cleared, WORKER_VRAM_TARGET_MIB, MAX_WORKER_DENSITY
 from decommission_node import decommission_clone
 from agentic_cron import cron_start, cron_status, cron_stop
 from persona_engine import PersonaEngine
@@ -423,6 +423,51 @@ def api_hive_decommission(payload: dict[str, Any]) -> dict[str, Any]:
     raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.post("/api/spawn-worker")
+def api_spawn_worker(payload: dict[str, Any]) -> dict[str, Any]:
+  """Sovereign Build v1.0 alias for /api/hive/spawn.
+
+  Wraps MitosisEngine.spawn_clone() with the worker-clone contract:
+  - 2228 MiB VRAM target enforced via GATOR_WORKER_VRAM_MIB env var
+  - 6x density cap enforced before subprocess fork
+  - Per-clone Lance scratchpad at db/transient_scratchpad.lance/<slug>
+  - Wakeup gate: refuses if Prime Gator has not cleared genesis verification
+  """
+  if not wakeup_cleared():
+    raise HTTPException(
+      status_code=409,
+      detail="Wakeup gate not cleared - Prime Gator has not passed ignition.",
+    )
+  name = str(payload.get("name") or "").strip()
+  if not name:
+    raise HTTPException(status_code=400, detail="name is required")
+  try:
+    node = MITOSIS.spawn_clone(name)
+    return {
+      "ok": True,
+      "node": node,
+      "hive": MITOSIS.hive_status(),
+      "vram_target_mib": WORKER_VRAM_TARGET_MIB,
+      "density_cap": MAX_WORKER_DENSITY,
+    }
+  except Exception as exc:
+    raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/hive/greenlight")
+def api_hive_greenlight() -> dict[str, Any]:
+  """Greenlight protocol status: wakeup + density + VRAM contract."""
+  status = MITOSIS.hive_status()
+  return {
+    "ok": True,
+    "wakeup_cleared": status.get("wakeup_cleared", False),
+    "greenlight": status.get("greenlight", False),
+    "worker_density": status.get("worker_density", {}),
+    "vram_target_mib": WORKER_VRAM_TARGET_MIB,
+    "density_cap": MAX_WORKER_DENSITY,
+  }
+
+
 @app.get("/api/cron/status")
 def api_cron_status() -> dict[str, Any]:
   return {"ok": True, **cron_status()}
@@ -651,6 +696,38 @@ def htmx_debug() -> str:
   return "\n".join(out) or "No debug data yet."
 
 
+@app.get("/htmx/greenlight", response_class=HTMLResponse)
+def htmx_greenlight() -> str:
+  """HTMX fragment: SYSTEM GREENLIGHT pill + auto-enables Spawn 35B Worker btn."""
+  status = MITOSIS.hive_status()
+  cleared = bool(status.get("wakeup_cleared", False))
+  greenlight = bool(status.get("greenlight", False))
+  density = status.get("worker_density", {})
+  live = int(density.get("live", 0))
+  cap = int(density.get("cap", MAX_WORKER_DENSITY))
+  vram = int(density.get("per_worker_vram_mib", WORKER_VRAM_TARGET_MIB))
+  if greenlight and live < cap:
+    bg, fg = "#1b6b3a", "#fff"
+    label = f"\u2705 SYSTEM GREENLIGHT \u00b7 {live}/{cap} workers \u00b7 {vram} MiB ea."
+    enable_js = ("<script>(function(){var b=document.getElementById('mitosisBtn');"
+                 "if(b){b.disabled=false;b.style.opacity='1';b.style.cursor='pointer';}})();</script>")
+  elif cleared and live >= cap:
+    bg, fg = "#a07020", "#fff"
+    label = f"\u26a0\ufe0f DENSITY CAP REACHED ({live}/{cap})"
+    enable_js = ("<script>(function(){var b=document.getElementById('mitosisBtn');"
+                 "if(b){b.disabled=true;b.style.opacity='0.5';b.style.cursor='not-allowed';}})();</script>")
+  else:
+    bg, fg = "#3a3a3a", "#aaa"
+    label = "\u23f3 AWAITING IGNITION"
+    enable_js = ("<script>(function(){var b=document.getElementById('mitosisBtn');"
+                 "if(b){b.disabled=true;b.style.opacity='0.5';b.style.cursor='not-allowed';}})();</script>")
+  return (
+    f'<span id="greenlightPill" class="pill" '
+    f'hx-get="/htmx/greenlight" hx-trigger="every 6s" hx-swap="outerHTML" '
+    f'style="background:{bg};color:{fg};font-weight:700">{label}</span>{enable_js}'
+  )
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     graph_url = "/graph" if GRAPH_HTML.exists() else ""
@@ -710,7 +787,15 @@ def index() -> str:
                 hx-swap="none"
                 hx-on::after-request="alert('Interrupt sent')">Interrupt</button>
         <button id="setupTelegramBtn">⚙️ Setup Telegram</button>
-        <button id="mitosisBtn">[M] MITOSIS</button>
+        <button id="mitosisBtn"
+                title="Spawn a 35B Worker clone (capped at 2228 MiB VRAM, 6x density)"
+                disabled
+                style="background:#1b6b3a;opacity:0.5;cursor:not-allowed">🧬 Spawn 35B Worker</button>
+        <span id="greenlightPill" class="pill"
+              hx-get="/htmx/greenlight"
+              hx-trigger="load, every 6s"
+              hx-swap="outerHTML"
+              style="background:#3a3a3a;color:#aaa">⏳ AWAITING IGNITION</span>
         <button style="background:#1e4060"
                 hx-post="/api/session_reset"
                 hx-swap="none"
@@ -1019,14 +1104,25 @@ def index() -> str:
     // ── Hive spawn / decommission ──────────────────────────────
     async function spawnClone() {{
       const name = document.getElementById('cloneName').value.trim();
-      const r = await fetch('/api/hive/spawn', {{
+      if (!name) {{ alert('Worker name required'); return; }}
+      const r = await fetch('/api/spawn-worker', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
         body: JSON.stringify({{ name }}),
       }});
       const d = await r.json();
-      document.getElementById('mitosisStatus').textContent = JSON.stringify(d, null, 2);
+      if (!r.ok) {{
+        document.getElementById('mitosisStatus').textContent =
+          'X ' + (d.detail || JSON.stringify(d));
+        return;
+      }}
+      const live = (d.hive && d.hive.worker_density && d.hive.worker_density.live) || '?';
+      document.getElementById('mitosisStatus').textContent =
+        'OK Spawned ' + name + ' pid=' + (d.node && d.node.pid) +
+        ' VRAM=' + d.vram_target_mib + ' MiB' +
+        ' density=' + live + '/' + d.density_cap;
       htmx.trigger(document.getElementById('hiveBody'), 'load');
+      htmx.trigger(document.getElementById('greenlightPill'), 'load');
     }}
     async function decommissionClone(cloneName) {{
       if (!cloneName) {{ alert('Please select a clone to decommission.'); return; }}

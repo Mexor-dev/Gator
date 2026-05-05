@@ -23,6 +23,23 @@ HIVE_ROOT = BIN_ROOT / "hive_nodes"
 HIVE_STATE_FILE = BIN_ROOT / "hive_state.json"
 PRIME_BRIDGE_URL = "http://127.0.0.1:8090"
 
+# Per-worker VRAM budget for the 35B-class graft.
+# 6 workers × 2228 MiB ≈ 13 GiB → fits 12 GiB hardware with headroom on shared layers.
+WORKER_VRAM_TARGET_MIB = 2228
+MAX_WORKER_DENSITY = 6
+GENESIS_ARTIFACT = LOG_ROOT / "genesis_artifact.json"
+
+
+def wakeup_cleared() -> bool:
+    """Return True iff the Prime Gator wakeup gates have all passed."""
+    try:
+        data = json.loads(GENESIS_ARTIFACT.read_text(encoding="utf-8"))
+        gv = data.get("genesis_verification") or {}
+        summary = gv.get("summary") or {}
+        return int(summary.get("failed", 1)) == 0 and int(summary.get("passed", 0)) > 0
+    except Exception:
+        return False
+
 
 class MitosisError(RuntimeError):
     pass
@@ -128,10 +145,17 @@ class MitosisEngine:
             return 0
 
     def _estimate_vram_split(self, clone_count: int) -> tuple[int, int]:
+        """Per-worker VRAM is fixed at the 35B graft target (2228 MiB).
+
+        We no longer divide a measured slack budget across workers — that
+        starved workers below the 35B graft minimum. The Sovereign Build
+        contract is: each worker reserves WORKER_VRAM_TARGET_MIB so the
+        hive can hit MAX_WORKER_DENSITY (6×) on 12 GiB hardware.
+        """
         total = self._current_vram_mib()
         if clone_count <= 0:
-            return total, 0
-        worker_budget = min(420, max(180, int((total - 1800) / max(1, clone_count))))
+            return total, WORKER_VRAM_TARGET_MIB
+        worker_budget = WORKER_VRAM_TARGET_MIB
         prime_est = max(0, total - worker_budget * clone_count)
         return prime_est, worker_budget
 
@@ -150,10 +174,28 @@ class MitosisEngine:
         if not name:
             raise MitosisError("Clone name is required")
 
+        # Wakeup gate: refuse to spawn until the Prime Gator has cleared ignition.
+        if not wakeup_cleared():
+            raise MitosisError(
+                "Wakeup gate not cleared - Prime Gator has not passed genesis "
+                "verification. Run wakeup before spawning workers."
+            )
+
         state = self._load_state()
         slug = _slug(name)
         if slug in state["clones"] and self._pid_alive(state["clones"][slug].get("pid")):
             raise MitosisError(f"Clone already active: {name}")
+
+        # Density gate: cap at MAX_WORKER_DENSITY live workers (2228 MiB × 6 ≈ 12 GiB).
+        live_count = sum(
+            1 for c in state["clones"].values()
+            if self._pid_alive(c.get("pid"))
+        )
+        if live_count >= MAX_WORKER_DENSITY:
+            raise MitosisError(
+                f"Worker density cap reached ({live_count}/{MAX_WORKER_DENSITY}). "
+                f"Decommission an existing clone before spawning a new one."
+            )
 
         role = self._role_for_name(name)
         toolset = self._toolset_for_role(role)
@@ -194,6 +236,12 @@ class MitosisEngine:
         bridge_script = self.root / "src" / "gator_bridge.py"
         log_file = self.log_root / f"clone_{slug}.log"
         log_fp = open(log_file, "ab")
+
+        # Per-clone Lance scratchpad namespace (transient context exchange).
+        scratchpad_root = self.root / "db" / "transient_scratchpad.lance"
+        clone_scratchpad = scratchpad_root / slug
+        clone_scratchpad.mkdir(parents=True, exist_ok=True)
+
         env = os.environ.copy()
         env["GATOR_NODE_NAME"] = name
         env["GATOR_ROLE"] = role
@@ -207,6 +255,12 @@ class MitosisEngine:
         env["GATOR_SYSTEM_IDENTITY"] = "cpp_rtx_direct"
         env["GATOR_VOICE_DISABLED"] = "true"
         env["GATOR_TEXT_ONLY"] = "true"
+        # Sovereign Build v1.0 worker-clone contract:
+        env["GATOR_WORKER_VRAM_MIB"] = str(WORKER_VRAM_TARGET_MIB)
+        env["GATOR_WORKER_DENSITY_CAP"] = str(MAX_WORKER_DENSITY)
+        env["GATOR_LANCE_SCRATCHPAD"] = str(clone_scratchpad)
+        env["GATOR_LANCE_SCRATCHPAD_NS"] = slug
+        env["GATOR_IS_WORKER_CLONE"] = "true"
 
         try:
             proc = subprocess.Popen(
@@ -245,6 +299,9 @@ class MitosisEngine:
             "started_at": time.time(),
             "shared_logic_singleton": True,
             "shared_scholar_memory": str(self.root / "db"),
+            "vram_target_mib": WORKER_VRAM_TARGET_MIB,
+            "lance_scratchpad": str(clone_scratchpad),
+            "lance_namespace": slug,
         }
         state["clones"][slug] = node
         self._save_state(state)
@@ -338,6 +395,16 @@ class MitosisEngine:
                 },
             },
         }
+        # Sovereign Build greenlight signal: wakeup cleared + at least one
+        # responsive worker (or just Prime alive when no workers spawned).
+        live_clones = [c for c in clone_items if c.get("status") == "WORKING"]
+        payload["wakeup_cleared"] = wakeup_cleared()
+        payload["worker_density"] = {
+            "live": len(live_clones),
+            "cap": MAX_WORKER_DENSITY,
+            "per_worker_vram_mib": WORKER_VRAM_TARGET_MIB,
+        }
+        payload["greenlight"] = bool(payload["wakeup_cleared"])
         self._save_state(state)
         return payload
 

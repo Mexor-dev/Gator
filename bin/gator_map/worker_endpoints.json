@@ -1,0 +1,98 @@
+{
+  "schema": "worker_endpoints.v1",
+  "comment": "Sovereign Build v1.0 - Worker Clone Integration endpoint registry",
+  "updated_at_iso": "2026-05-04",
+  "wakeup_gate": {
+    "artifact": "logs/genesis_artifact.json",
+    "required_keys": ["genesis_verification.summary.failed == 0", "genesis_verification.summary.passed > 0"]
+  },
+  "worker_contract": {
+    "vram_target_mib": 2228,
+    "max_density": 6,
+    "lance_scratchpad_root": "db/transient_scratchpad.lance",
+    "per_clone_namespace": "db/transient_scratchpad.lance/<slug>",
+    "env_vars": [
+      "GATOR_WORKER_VRAM_MIB",
+      "GATOR_WORKER_DENSITY_CAP",
+      "GATOR_LANCE_SCRATCHPAD",
+      "GATOR_LANCE_SCRATCHPAD_NS",
+      "GATOR_IS_WORKER_CLONE"
+    ]
+  },
+  "endpoints": {
+    "POST /api/spawn-worker": {
+      "module": "src/interfaces/webui.py",
+      "handler": "api_spawn_worker",
+      "purpose": "Sovereign alias for hive spawn; enforces wakeup gate + VRAM/density contract",
+      "request": {"name": "string (required)"},
+      "response": {
+        "ok": "bool",
+        "node": "object (mitosis clone record)",
+        "hive": "object (hive_status snapshot)",
+        "vram_target_mib": 2228,
+        "density_cap": 6
+      },
+      "errors": {
+        "409": "Wakeup gate not cleared",
+        "400": "name is required",
+        "500": "MitosisError (e.g. density cap reached)"
+      }
+    },
+    "GET /api/hive/greenlight": {
+      "module": "src/interfaces/webui.py",
+      "handler": "api_hive_greenlight",
+      "purpose": "Greenlight protocol JSON status for external monitors",
+      "response": {
+        "ok": "bool",
+        "wakeup_cleared": "bool",
+        "greenlight": "bool",
+        "worker_density": {"live": "int", "cap": "int", "per_worker_vram_mib": "int"},
+        "vram_target_mib": 2228,
+        "density_cap": 6
+      }
+    },
+    "GET /htmx/greenlight": {
+      "module": "src/interfaces/webui.py",
+      "handler": "htmx_greenlight",
+      "purpose": "HTMX fragment: SYSTEM GREENLIGHT pill + auto-enables Spawn 35B Worker button",
+      "response_type": "text/html",
+      "polled_every_seconds": 6
+    },
+    "POST /api/hive/spawn": {
+      "module": "src/interfaces/webui.py",
+      "handler": "api_hive_spawn",
+      "purpose": "Legacy hive spawn endpoint (still active; superseded by /api/spawn-worker for UI)"
+    },
+    "POST /api/hive/decommission": {
+      "module": "src/interfaces/webui.py",
+      "handler": "api_hive_decommission",
+      "purpose": "Graceful clone teardown; cleans Lance scratchpad namespace"
+    },
+    "GET /api/hive/status": {
+      "module": "src/interfaces/webui.py",
+      "handler": "api_hive_status",
+      "purpose": "Full hive status: prime + clones + density + greenlight"
+    }
+  },
+  "ui_controls": {
+    "spawn_button": {
+      "id": "mitosisBtn",
+      "label": "🧬 Spawn 35B Worker",
+      "disabled_default": true,
+      "enabled_when": "greenlight && live < cap",
+      "calls": "POST /api/spawn-worker"
+    },
+    "greenlight_pill": {
+      "id": "greenlightPill",
+      "states": {
+        "AWAITING IGNITION": "Wakeup gate not cleared",
+        "SYSTEM GREENLIGHT": "Cleared + density < cap",
+        "DENSITY CAP REACHED": "Cleared + at cap"
+      }
+    }
+  },
+  "validation": {
+    "ghost_test": "_ghost_test_workers.py",
+    "last_run_passed": "33/33 (Sovereign v1.0 Greenlight)"
+  }
+}
