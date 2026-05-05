@@ -52,7 +52,7 @@ def _load_state() -> dict[str, Any]:
 
 
 def _save_state(payload: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(DEFAULT_SCHEDULE)
+    merged = _load_state()
     merged.update(payload)
     BIN_ROOT.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(merged, indent=2), encoding="utf-8")
