@@ -1,47 +1,42 @@
-# Project Gator
+# Gator Sovereign Entity
 
-Project Gator is a local-first research and reasoning stack built around a native inference kernel, a structural blueprint map, and a self-maintaining learning loop for constrained GPU hardware.
+## Getting Started
 
-## Components
-
-- Native kernel: [src/inference/gator_kern.cpp](src/inference/gator_kern.cpp)
-- Kernel runtime wrapper: [src/inference/gator_kern.py](src/inference/gator_kern.py)
-- Structural blueprint: [src/core/gator_map.py](src/core/gator_map.py)
-- Maintenance loop: [src/maintenance.py](src/maintenance.py)
-- Research store: [src/scholar_sense.py](src/scholar_sense.py)
-- Runtime bridge: [src/gator_bridge.py](src/gator_bridge.py)
-- Web UI: [src/interfaces/webui.py](src/interfaces/webui.py)
-
-## One-Line Install
+Run exactly this:
 
 ```bash
-git clone <your-repo-url> Gator && cd Gator && bash install.sh
+chmod +x bootstrap.sh && ./bootstrap.sh
 ```
 
-Telegram-enabled one-line installer:
+### What this does
+
+- Creates/refreshes a Python venv and upgrades `pip`, `setuptools`, and `wheel`.
+- Installs the Phase-2 production runtime stack: `llama-cpp-python`, `lancedb`, `fastapi`, `uvicorn`, and vendors HTMX locally for the UI.
+- Loads graft definitions from `models/manifest.json` and downloads the donor/chassis models with resume support.
+- Verifies SHA-256 integrity of each `.gguf` before continuing.
+- Detects acceleration (CUDA, ROCm, Metal, AVX2) and compiles `libgator_kern.so`.
+- Runs a forensic scrub that removes setup scaffolding:
+  - archives (`.zip`, `.tar`, `.tar.gz`, `.tgz`, `.xz`, `.7z`)
+  - temporary C++ objects/static libs (`.o`, `.a`)
+  - setup cache/build/log directories
+- Protects active assets during purge: `models/*.gguf` and `src/inference/libgator_kern.so`.
+- Executes a silent wakeup ignition test and validates HTMX fragments plus VRAM target (`2228 MiB` default).
+
+### Bootstrap Recovery
+
+If the donor file is deleted or corrupted:
+
+1. Remove the broken model file from `models/` (for example `models/donor.gguf`).
+2. Re-run bootstrap:
 
 ```bash
-git clone <your-repo-url> Gator && cd Gator && GATOR_TG_BOT_TOKEN="<token>" GATOR_TG_AUTH_CHAT_ID="<chat_id>" bash install.sh
+./bootstrap.sh
 ```
 
-## Start
+Bootstrap will re-download from `models/manifest.json`, verify SHA-256, and re-run ignition checks.
+
+### Optional Dry Run
 
 ```bash
-GATOR_DAEMON=true ./wakeup
+./bootstrap.sh --dry-run
 ```
-
-## Release Gates
-
-Run the production gauntlet with:
-
-```bash
-./venv/bin/python tests/test_release_gauntlet.py
-```
-
-Run the swarm gauntlet with:
-
-```bash
-./venv/bin/python tests/test_swarm_gauntlet.py
-```
-
-Hive map output is written to `bin/gator_map/gator_hive_map.json`.

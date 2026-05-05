@@ -23,6 +23,7 @@ from event_bus import EventBusClient, EventBusError
 from memory_core import GatorMemoryCore
 from core.native_tools import NativeToolchain, NativeToolsError
 from maintenance import GatorMaintenance
+from persona_engine import PersonaEngine
 
 GATOR_ROOT = Path(__file__).resolve().parents[1]
 GATE_PATH = GATOR_ROOT / "bin" / "logic_map.gate"
@@ -117,6 +118,7 @@ class GatorBridge:
         self.node_role: str = str(os.environ.get("GATOR_ROLE", "prime") or "prime").strip().lower()
         self.tools = NativeToolchain(root=GATOR_ROOT)
         self.maintenance = GatorMaintenance(root=GATOR_ROOT)
+        self.persona = PersonaEngine(root=GATOR_ROOT)
 
     def _emit_debug(self, payload: dict[str, Any]) -> None:
         # Single-line stage markers required by clean-log policy.
@@ -207,8 +209,12 @@ class GatorBridge:
         top_p: float,
         min_p: float,
     ) -> str:
+        steering = self.persona.build_steering_fragment()
+        effective_donor_prompt = (
+            f"{steering}\n\n{LOGIC_DONOR_PROMPT}" if steering else LOGIC_DONOR_PROMPT
+        )
         logic_text = self._chat_completion(
-            system_prompt=LOGIC_DONOR_PROMPT,
+            system_prompt=effective_donor_prompt,
             user_prompt=prompt,
             max_tokens=max(128, max_tokens),
             temperature=max(0.1, temperature),
@@ -329,6 +335,10 @@ class GatorBridge:
             self._stage_egress(generated, request_id=request_id)
             self._remember_turn(prompt, generated)
             self._touch_activity()
+            try:
+                self.persona.record_reflection(generated)
+            except Exception:
+                pass
 
             final_packet = {
                 "type": "generation_final",

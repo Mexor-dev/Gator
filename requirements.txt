@@ -2,6 +2,7 @@ fastapi
 uvicorn
 python-dotenv
 lancedb
+llama-cpp-python
 numpy
 pyarrow
 pandas

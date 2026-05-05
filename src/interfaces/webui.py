@@ -21,7 +21,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dotenv import dotenv_values, load_dotenv, set_key
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
@@ -32,6 +32,7 @@ from discovery.cluster_namer import ClusterNamer, ClusterNamerError
 from core.mitosis import MitosisEngine
 from decommission_node import decommission_clone
 from agentic_cron import cron_start, cron_status, cron_stop
+from persona_engine import PersonaEngine
 
 GATOR_ROOT = Path(__file__).resolve().parents[2]
 GRAPH_HTML = GATOR_ROOT / "research" / "graphify-out" / "graph.html"
@@ -47,6 +48,7 @@ PRIME_BRIDGE_URL = os.environ.get("PRIME_BRIDGE_URL", "http://127.0.0.1:8090")
 app = FastAPI(title="Gator Surgical Lab", version="1.0")
 MITOSIS = MitosisEngine(root=GATOR_ROOT)
 CLUSTER_NAMER = ClusterNamer(graph_json=GRAPH_JSON)
+PERSONA = PersonaEngine(root=GATOR_ROOT)
 
 
 def _set_ingest_status(state: str, percent: int, detail: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -436,22 +438,236 @@ def api_cron_stop() -> dict[str, Any]:
   return {"ok": True, **cron_stop()}
 
 
+@app.get("/api/persona")
+def api_persona_get() -> dict[str, Any]:
+  traits = PERSONA.current_traits()
+  recent = PERSONA.get_reflections(limit=5)
+  return {"ok": True, "traits": traits, "recent_reflections": recent}
+
+
+@app.post("/api/persona")
+async def api_persona_post(request: Request) -> dict[str, Any]:
+  body: dict[str, Any] = {}
+  try:
+    body = await request.json()
+  except Exception:
+    pass
+  updates = body.get("traits", {})
+  if not isinstance(updates, dict):
+    raise HTTPException(status_code=400, detail="traits must be a JSON object")
+  updated = PERSONA.set_traits({k: float(v) for k, v in updates.items()})
+  return {"ok": True, "traits": updated}
+
+
+@app.get("/api/persona/reflections")
+def api_persona_reflections(limit: int = Query(10, ge=1, le=100)) -> dict[str, Any]:
+  return {"ok": True, "reflections": PERSONA.get_reflections(limit=limit)}
+
+
+# ---------------------------------------------------------------------------
+# HTMX fragment endpoints — return HTML partials for attribute-driven polling
+# ---------------------------------------------------------------------------
+
+@app.get("/htmx/vitals", response_class=HTMLResponse)
+def htmx_vitals() -> str:
+  try:
+    data = run_pulse()
+    data["telegram"] = _telegram_status()
+  except Exception as exc:
+    return f'<span class="pill" style="background:#8b1f2a">Vitals error: {exc}</span>'
+  perf = data.get("performance", {})
+  canary = data.get("canary", {})
+  tg = data.get("telegram", {})
+  icon = "🟢" if data.get("status") == "PASS" else "🔴"
+  mode = "NATIVE" if canary.get("native_mode") else (str(data.get("status") or "UNKNOWN"))
+  donor = f" [{canary['donor_addr']}]" if canary.get("donor_addr") else ""
+  pills = [
+    f"{icon} {mode}{donor}",
+    f"TPS~ {perf.get('tps_est', 'n/a')}",
+    f"VRAM: {data.get('vram', 'n/a')}",
+    f"Telegram: {tg.get('indicator', '🔴')}",
+    f"Bias: {canary.get('biases_applied_total', 0)}",
+  ]
+  if canary.get("native_mode"):
+    pills.append("native://gator_kern 🟢")
+  return "".join(f'<span class="pill">{p}</span>' for p in pills)
+
+
+@app.get("/htmx/vram", response_class=HTMLResponse)
+def htmx_vram() -> str:
+  try:
+    data = run_pulse()
+    vram_str = str(data.get("vram") or "n/a")
+  except Exception:
+    vram_str = "n/a"
+  pct = 0
+  try:
+    num = float(re.search(r"[\d.]+", vram_str).group())  # type: ignore[union-attr]
+    limit = 8.0 if "GiB" in vram_str else 8192.0
+    pct = min(100, int(num / limit * 100))
+  except Exception:
+    pct = 0
+  bar_color = "#1b6b3a" if pct < 60 else "#d8742f" if pct < 85 else "#8b1f2a"
+  return (
+    f'<div style="display:flex;align-items:center;gap:12px;">'
+    f'<span style="min-width:52px;font-size:12px;color:#7ab3d4;font-weight:700">VRAM</span>'
+    f'<div style="flex:1;height:12px;background:#0a1016;border-radius:999px;overflow:hidden;border:1px solid #24384a;">'
+    f'<div style="height:100%;width:{pct}%;background:{bar_color};transition:width 0.6s;"></div></div>'
+    f'<span class="pill" style="min-width:80px;text-align:center">{vram_str} ({pct}%)</span>'
+    f'</div>'
+  )
+
+
+@app.get("/htmx/cron_status", response_class=HTMLResponse)
+def htmx_cron_status() -> str:
+  cs = cron_status()
+  enabled = bool(cs.get("enabled")) and bool(cs.get("alive"))
+  pid = cs.get("pid", "—")
+  badge_bg = "#1b6b3a" if enabled else "#334a60"
+  badge_text = f"ON [pid={pid}]" if enabled else "OFF"
+  status_payload = cs.get("status") or {}
+  current_task = status_payload.get("current_task") or "—"
+  last_results = status_payload.get("last_results") or {}
+  rows = [
+    f'<span class="pill" style="background:{badge_bg}">{badge_text}</span>',
+    f'<div style="margin-top:6px;font-size:12px;color:#8ea2b8">Active task: '
+    f'<strong style="color:#d6e2ef">{current_task}</strong></div>',
+  ]
+  if last_results:
+    rows.append('<div style="margin-top:4px;font-size:11px;color:#6a8898">Last cycle:</div>')
+    for task_name, result in list(last_results.items())[:4]:
+      r_str = str(result)[:80]
+      rows.append(
+        f'<div style="font-size:11px;margin-left:8px;color:#8ea2b8;padding:1px 0">'
+        f'• {task_name}: {r_str}</div>'
+      )
+  return "\n".join(rows)
+
+
+@app.get("/htmx/tools_stream", response_class=HTMLResponse)
+def htmx_tools_stream() -> str:
+  import datetime
+  entries: list[dict[str, Any]] = []
+  if DEBUG_FILE.exists():
+    try:
+      lines = DEBUG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+      for ln in lines:
+        try:
+          obj = json.loads(ln)
+          stage = obj.get("stage", "")
+          if stage:
+            entries.append({
+              "ts": obj.get("ts", 0),
+              "type": "stage",
+              "label": str(stage),
+              "ok": bool(obj.get("ok", True)),
+            })
+        except Exception:
+          pass
+    except Exception:
+      pass
+  cs = cron_status()
+  status_payload = cs.get("status") or {}
+  current_task = status_payload.get("current_task")
+  if current_task:
+    entries.append({
+      "ts": time.time(),
+      "type": "cron",
+      "label": f"[cron] {current_task}",
+      "ok": True,
+    })
+  entries.sort(key=lambda e: e.get("ts", 0), reverse=True)
+  if not entries:
+    return (
+      '<span style="color:#6a8898;font-size:12px">'
+      'No activity yet — awaiting first generation or cron task.</span>'
+    )
+  rows = []
+  for e in entries[:14]:
+    bg = "#1b3a28" if e.get("ok", True) else "#3a1b1b"
+    ts = e.get("ts")
+    t_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else ""
+    rows.append(
+      f'<div style="display:flex;align-items:center;gap:8px;padding:3px 0;'
+      f'border-bottom:1px solid #1a2736;">'
+      f'<span style="font-size:10px;color:#6a8898;min-width:58px">{t_str}</span>'
+      f'<span class="pill" style="background:{bg};font-size:11px">{e["label"]}</span>'
+      f'</div>'
+    )
+  return "\n".join(rows)
+
+
+@app.get("/htmx/hive", response_class=HTMLResponse)
+def htmx_hive() -> str:
+  try:
+    hive_data = MITOSIS.hive_status()
+  except Exception as exc:
+    return f'<span class="pill" style="background:#8b1f2a">Hive error: {exc}</span>'
+  prime = hive_data.get("prime", {})
+  clones_raw = hive_data.get("clones", {})
+  clones = list(clones_raw.values()) if isinstance(clones_raw, dict) else (clones_raw or [])
+  rows = [
+    '<table style="width:100%;font-size:12px;border-collapse:collapse">',
+    '<tr>'
+    '<th style="text-align:left;padding:4px;color:#7ab3d4">Node</th>'
+    '<th style="text-align:left;padding:4px;color:#7ab3d4">Status</th>'
+    '<th style="text-align:right;padding:4px;color:#7ab3d4">VRAM</th>'
+    '</tr>',
+    f'<tr><td style="padding:4px">Gator-Prime</td>'
+    f'<td style="padding:4px"><span class="pill">{prime.get("status", "UNKNOWN")}</span></td>'
+    f'<td style="padding:4px;text-align:right">{prime.get("vram_mib", 0)} MiB</td></tr>',
+  ]
+  opts = ['<option value="">-- Select a clone to decommission --</option>']
+  for node in clones:
+    name = node.get("name", "?")
+    rows.append(
+      f'<tr><td style="padding:4px">{name}</td>'
+      f'<td style="padding:4px"><span class="pill">{node.get("status", "?")}</span></td>'
+      f'<td style="padding:4px;text-align:right">{node.get("vram_mib", 0)} MiB</td></tr>'
+    )
+    opts.append(f'<option value="{name}">{name}</option>')
+  rows.append('</table>')
+  # OOB-swap the clone select options alongside the table
+  select_oob = (
+    f'<select id="cloneSelect" hx-swap-oob="true"'
+    f' style="flex:1;padding:8px;border-radius:8px;border:1px solid #24384a;background:#0f1720;color:#d6e2ef">'
+    + "".join(opts) +
+    '</select>'
+  )
+  return "\n".join(rows) + "\n" + select_oob
+
+
+@app.get("/htmx/debug", response_class=HTMLResponse)
+def htmx_debug() -> str:
+  if not DEBUG_FILE.exists():
+    return "No debug data yet."
+  lines = DEBUG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+  out = []
+  for ln in lines:
+    try:
+      out.append(json.dumps(json.loads(ln), ensure_ascii=True))
+    except Exception:
+      out.append(ln)
+  return "\n".join(out) or "No debug data yet."
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     graph_url = "/graph" if GRAPH_HTML.exists() else ""
     graph_frame = (
-    f'<iframe id="graphFrame" src="{graph_url}"></iframe>'
+        f'<iframe id="graphFrame" src="{graph_url}"></iframe>'
         if graph_url
         else '<pre>graph.html not found. Run scholar/graphify update first.</pre>'
     )
     return f"""<!doctype html>
 <html>
 <head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Gator Surgical Lab</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
   <style>
-  :root {{ --bg:#0c1218; --card:#131d27; --ink:#d6e2ef; --muted:#8ea2b8; }}
+    :root {{ --bg:#0c1218; --card:#131d27; --ink:#d6e2ef; --muted:#8ea2b8; }}
     body {{ margin:0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: radial-gradient(1200px 600px at 20% -20%, #1a2836, var(--bg)); color:var(--ink); }}
     .wrap {{ padding:16px; display:grid; grid-template-columns: 1.1fr 1fr; gap:12px; }}
     .card {{ background:var(--card); border:1px solid #1f2c39; border-radius:12px; padding:12px; box-shadow: 0 8px 24px rgba(0,0,0,.25); }}
@@ -462,72 +678,184 @@ def index() -> str:
     button {{ background:#8b1f2a; color:#fff; border:0; border-radius:8px; padding:8px 12px; cursor:pointer; font-weight:700; }}
     iframe {{ width:100%; min-height:420px; border:0; border-radius:10px; background:#0a1016; }}
     pre {{ max-height:280px; overflow:auto; white-space:pre-wrap; font-size:11px; background:#0f1720; border-radius:8px; padding:10px; }}
+    .vram-strip {{ padding:8px 16px 4px; }}
+    .stream-entry {{ display:flex; align-items:center; gap:8px; padding:3px 0; border-bottom:1px solid #1a2736; }}
     @media (max-width: 900px) {{ .wrap {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
-  <div class=\"wrap\">
-    <section class=\"card\">
-      <h1>Vitals</h1>
-      <h2>Live TPS, PID health, canary graft state, VRAM <span id="tgStatusInline" class="pill">Telegram: 🔴</span></h2>
-      <div id=\"pills\" class=\"row\"></div>
-      <div class="row" style="margin:8px 0">
+
+  <!-- VRAM monitor strip (HTMX-polled every 5s) -->
+  <div class="vram-strip"
+       hx-get="/htmx/vram"
+       hx-trigger="load, every 5s"
+       hx-swap="innerHTML">
+    <span style="color:#6a8898;font-size:12px">VRAM loading…</span>
+  </div>
+
+  <div class="wrap">
+
+    <!-- ── Vitals card ──────────────────────────────────────── -->
     <section class="card">
-      <h1>Agentic Cron</h1>
-      <h2>Dreaming / maintenance runner with hard off switch</h2>
+      <h1>Vitals</h1>
+      <h2>Live TPS · native kernel · VRAM · Telegram</h2>
+      <div id="pills" class="row"
+           hx-get="/htmx/vitals"
+           hx-trigger="load, every 7s"
+           hx-swap="innerHTML">
+        <span class="pill">Loading…</span>
+      </div>
       <div class="row" style="margin:8px 0">
-        <button id="cronOnBtn" style="background:#1b6b3a">Cron ON</button>
-        <button id="cronOffBtn" style="background:#8b1f2a">Cron OFF</button>
-        <span id="cronBadge" class="pill">Cron: OFF</span>
-      </div>
-      <pre id="cronStatus">Loading cron status...</pre>
-    </section>
-        <button id="interruptBtn">Interrupt</button>
+        <button hx-post="/api/interrupt"
+                hx-swap="none"
+                hx-on::after-request="alert('Interrupt sent')">Interrupt</button>
         <button id="setupTelegramBtn">⚙️ Setup Telegram</button>
-          <button id="mitosisBtn">[M] MITOSIS</button>
-          <button id="sessionResetBtn" style="background:#1e4060">↺ Reset Session</button>
+        <button id="mitosisBtn">[M] MITOSIS</button>
+        <button style="background:#1e4060"
+                hx-post="/api/session_reset"
+                hx-swap="none"
+                hx-on::after-request="alert('Session reset sent')">↺ Reset Session</button>
       </div>
-      <pre id=\"vitals\">Loading...</pre>
     </section>
-    <section class=\"card\">
+
+    <!-- ── Graph Map card ───────────────────────────────────── -->
+    <section class="card">
       <h1>Graph Map</h1>
       <h2>Graphify structural map</h2>
       {graph_frame}
     </section>
-    <section class=\"card\" style=\"grid-column:1/-1;\">
+
+    <!-- ── Cron / Heartbeat card ────────────────────────────── -->
+    <section class="card">
+      <h1>Cron / Heartbeat</h1>
+      <h2>Dreaming &amp; maintenance runner — hard kill switch</h2>
+      <div class="row" style="margin-bottom:8px">
+        <button onclick="setCronEnabled(true)"  style="background:#1b6b3a">Cron ON</button>
+        <button onclick="setCronEnabled(false)" style="background:#8b1f2a">Cron OFF</button>
+      </div>
+      <div id="cronBody"
+           hx-get="/htmx/cron_status"
+           hx-trigger="load, every 3s"
+           hx-swap="innerHTML">
+        <span class="pill">Loading…</span>
+      </div>
+    </section>
+
+    <!-- ── Task / Tool Stream widget ────────────────────────── -->
+    <section class="card">
+      <h1>Task / Tool Stream</h1>
+      <h2>Live generation stages &amp; cron task heartbeat</h2>
+      <div id="toolStream"
+           hx-get="/htmx/tools_stream"
+           hx-trigger="load, every 3s"
+           hx-swap="innerHTML">
+        <span style="color:#6a8898;font-size:12px">Loading…</span>
+      </div>
+    </section>
+
+    <!-- ── Persona Engine (full width) ──────────────────────── -->
+    <section class="card" style="grid-column:1/-1;">
+      <h1>Persona Engine</h1>
+      <h2>Neural trait sliders — steer the 35B logic donor in real time</h2>
+      <div id="personaSliders" style="display:grid;gap:10px;margin:10px 0;">
+        <div><label style="display:flex;align-items:center;gap:10px;font-size:13px;">
+          <span style="min-width:90px;color:#7ab3d4">Curiosity</span>
+          <input type="range" id="traitCuriosity" min="0" max="100" value="50" style="flex:1" oninput="updatePersonaLabel(this,'curiosity')" />
+          <span id="lblCuriosity" class="pill" style="min-width:60px;text-align:center">50%</span>
+          <span style="font-size:11px;color:#6a8898;min-width:170px">focused → exploratory</span>
+        </label></div>
+        <div><label style="display:flex;align-items:center;gap:10px;font-size:13px;">
+          <span style="min-width:90px;color:#7ab3d4">Directness</span>
+          <input type="range" id="traitDirectness" min="0" max="100" value="50" style="flex:1" oninput="updatePersonaLabel(this,'directness')" />
+          <span id="lblDirectness" class="pill" style="min-width:60px;text-align:center">50%</span>
+          <span style="font-size:11px;color:#6a8898;min-width:170px">verbose → surgical</span>
+        </label></div>
+        <div><label style="display:flex;align-items:center;gap:10px;font-size:13px;">
+          <span style="min-width:90px;color:#7ab3d4">Caution</span>
+          <input type="range" id="traitCaution" min="0" max="100" value="50" style="flex:1" oninput="updatePersonaLabel(this,'caution')" />
+          <span id="lblCaution" class="pill" style="min-width:60px;text-align:center">50%</span>
+          <span style="font-size:11px;color:#6a8898;min-width:170px">bold → careful</span>
+        </label></div>
+        <div><label style="display:flex;align-items:center;gap:10px;font-size:13px;">
+          <span style="min-width:90px;color:#7ab3d4">Creativity</span>
+          <input type="range" id="traitCreativity" min="0" max="100" value="50" style="flex:1" oninput="updatePersonaLabel(this,'creativity')" />
+          <span id="lblCreativity" class="pill" style="min-width:60px;text-align:center">50%</span>
+          <span style="font-size:11px;color:#6a8898;min-width:170px">conventional → inventive</span>
+        </label></div>
+        <div><label style="display:flex;align-items:center;gap:10px;font-size:13px;">
+          <span style="min-width:90px;color:#7ab3d4">Empathy</span>
+          <input type="range" id="traitEmpathy" min="0" max="100" value="50" style="flex:1" oninput="updatePersonaLabel(this,'empathy')" />
+          <span id="lblEmpathy" class="pill" style="min-width:60px;text-align:center">50%</span>
+          <span style="font-size:11px;color:#6a8898;min-width:170px">clinical → warm</span>
+        </label></div>
+        <div><label style="display:flex;align-items:center;gap:10px;font-size:13px;">
+          <span style="min-width:90px;color:#7ab3d4">Precision</span>
+          <input type="range" id="traitPrecision" min="0" max="100" value="50" style="flex:1" oninput="updatePersonaLabel(this,'precision')" />
+          <span id="lblPrecision" class="pill" style="min-width:60px;text-align:center">50%</span>
+          <span style="font-size:11px;color:#6a8898;min-width:170px">approximate → exact</span>
+        </label></div>
+      </div>
+      <div class="row" style="margin-bottom:8px;">
+        <button id="personaSaveBtn" style="background:#1b6b3a">Apply Traits</button>
+        <button id="personaLoadBtn" style="background:#1e4060">Reload</button>
+        <span id="personaSaveStatus" class="pill">idle</span>
+      </div>
+      <pre id="personaReflections" style="max-height:160px;overflow:auto">Loading reflections…</pre>
+    </section>
+
+    <!-- ── Debug Decisions (full width, HTMX-polled) ─────────── -->
+    <section class="card" style="grid-column:1/-1;">
       <h1>Debug Decisions</h1>
       <h2>High-fidelity logit decisions (when GATOR_DEBUG=true)</h2>
-      <pre id=\"debug\">No debug data yet.</pre>
+      <pre id="debug"
+           hx-get="/htmx/debug"
+           hx-trigger="load, every 9s"
+           hx-swap="innerHTML">No debug data yet.</pre>
     </section>
-    <section class=\"card\" style=\"grid-column:1/-1;\">
+
+    <!-- ── Ingestion (full width) ────────────────────────────── -->
+    <section class="card" style="grid-column:1/-1;">
       <h1>Ingestion</h1>
       <h2>Shredding and Distillation progress</h2>
-      <div class=\"row\" style=\"margin-bottom:8px;\">
-        <input id=\"pdfPath\" type=\"text\" placeholder=\"/home/user/Gator/research/sample.pdf\" style=\"flex:1;padding:8px;border-radius:8px;border:1px solid #24384a;background:#0f1720;color:#d6e2ef\" />
-        <button id=\"ingestBtn\">Start Ingest</button>
+      <div class="row" style="margin-bottom:8px;">
+        <input id="pdfPath" type="text"
+               placeholder="/home/user/Gator/research/sample.pdf"
+               style="flex:1;padding:8px;border-radius:8px;border:1px solid #24384a;background:#0f1720;color:#d6e2ef" />
+        <button id="ingestBtn">Start Ingest</button>
       </div>
-      <div style=\"height:16px;background:#0f1720;border-radius:999px;overflow:hidden;border:1px solid #24384a;\">
-        <div id=\"ingestBar\" style=\"height:100%;width:0%;background:linear-gradient(90deg,#8b1f2a,#d8742f);\"></div>
+      <div style="height:16px;background:#0f1720;border-radius:999px;overflow:hidden;border:1px solid #24384a;">
+        <div id="ingestBar" style="height:100%;width:0%;background:linear-gradient(90deg,#8b1f2a,#d8742f);"></div>
       </div>
-      <div class=\"row\" style=\"margin-top:8px;\">
-        <span class=\"pill\">Phase: <span id=\"ingestPhase\">idle</span></span>
-        <span class=\"pill\">Progress: <span id=\"ingestPercent\">0</span>%</span>
-        <span class=\"pill\">Markers: Shredding / Distillation / Indexing</span>
+      <div class="row" style="margin-top:8px;">
+        <span class="pill">Phase: <span id="ingestPhase">idle</span></span>
+        <span class="pill">Progress: <span id="ingestPercent">0</span>%</span>
+        <span class="pill">Markers: Shredding / Distillation / Indexing</span>
       </div>
-      <pre id=\"ingestStatus\">Idle</pre>
+      <pre id="ingestStatus">Idle</pre>
     </section>
-      <section class="card" style="grid-column:1/-1;">
-        <h1>Hive Status</h1>
-        <h2>Active clones and per-node VRAM footprint</h2>
-        <div class="row" style="margin-bottom:8px;">
-          <select id="cloneSelect" style="flex:1;padding:8px;border-radius:8px;border:1px solid #24384a;background:#0f1720;color:#d6e2ef">
-            <option value="">-- Select a clone to decommission --</option>
-          </select>
-          <button id="decommissionBtn" style="background:#8b4a4a">Decommission</button>
-        </div>
-        <pre id="hiveStatus">Loading hive...</pre>
-      </section>
-  </div>
+
+    <!-- ── Hive Status (full width, HTMX-polled) ─────────────── -->
+    <section class="card" style="grid-column:1/-1;">
+      <h1>Hive Status</h1>
+      <h2>Active clones and per-node VRAM footprint</h2>
+      <div class="row" style="margin-bottom:8px;">
+        <select id="cloneSelect"
+                style="flex:1;padding:8px;border-radius:8px;border:1px solid #24384a;background:#0f1720;color:#d6e2ef">
+          <option value="">-- Select a clone to decommission --</option>
+        </select>
+        <button id="decommissionBtn" style="background:#8b4a4a">Decommission</button>
+      </div>
+      <div id="hiveBody"
+           hx-get="/htmx/hive"
+           hx-trigger="load, every 4s"
+           hx-swap="innerHTML">
+        <span style="color:#6a8898;font-size:12px">Loading hive…</span>
+      </div>
+    </section>
+
+  </div><!-- /.wrap -->
+
+  <!-- ── Modals ──────────────────────────────────────────────── -->
   <div id="tgModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);align-items:center;justify-content:center;z-index:9999;">
     <div class="card" style="width:min(520px,92vw)">
       <h1>Telegram Setup</h1>
@@ -563,10 +891,8 @@ def index() -> str:
       <h1>Decommission Clone</h1>
       <h2 id="decommissionPrompt">Are you sure?</h2>
       <p style="color:#d6e2ef;font-size:13px;line-height:1.6;">
-        The clone process will be terminated and its environment files cleaned up.
-        <br><br>
-        <strong>Scholar Sense data will be PRESERVED</strong> — the clone's knowledge contribution remains in the shared memory.
-        <br><br>
+        The clone process will be terminated and its environment files cleaned up.<br><br>
+        <strong>Scholar Sense data will be PRESERVED</strong> — the clone's knowledge contribution remains in the shared memory.<br><br>
         <span id="decommissionWarning" style="color:#f4a46e;">⚠️ This action cannot be undone.</span>
       </p>
       <div class="row" style="margin-top:10px;">
@@ -576,31 +902,29 @@ def index() -> str:
       <pre id="decommissionStatus" style="margin-top:8px;">Idle</pre>
     </div>
   </div>
+
   <script>
-    function showModal() {{
-      document.getElementById('tgModal').style.display = 'flex';
+    // ── Modal helpers ──────────────────────────────────────────
+    function showModal() {{ document.getElementById('tgModal').style.display = 'flex'; }}
+    function hideModal() {{ document.getElementById('tgModal').style.display = 'none'; }}
+    function showMitosisModal() {{ document.getElementById('mitosisModal').style.display = 'flex'; }}
+    function hideMitosisModal() {{ document.getElementById('mitosisModal').style.display = 'none'; }}
+    function showDecommissionModal(cloneName) {{
+      document.getElementById('decommissionModal').style.display = 'flex';
+      document.getElementById('decommissionPrompt').textContent = 'Decommission ' + cloneName + '?';
+      document.getElementById('decommissionStatus').textContent = 'Ready to confirm.';
+      document.getElementById('decommissionConfirmBtn').dataset.cloneName = cloneName;
     }}
-    function hideModal() {{
-      document.getElementById('tgModal').style.display = 'none';
-    }}
-    function showMitosisModal() {{
-      document.getElementById('mitosisModal').style.display = 'flex';
-    }}
-    function hideMitosisModal() {{
-      document.getElementById('mitosisModal').style.display = 'none';
-    }}
+    function hideDecommissionModal() {{ document.getElementById('decommissionModal').style.display = 'none'; }}
+
+    // ── Telegram config modal ──────────────────────────────────
     async function loadTelegramConfig() {{
       const r = await fetch('/api/config/telegram');
       const d = await r.json();
-      const token = document.getElementById('tgToken');
-      token.value = d.token || '';
-      token.placeholder = '';
-      const username = document.getElementById('tgUsername');
-      username.value = d.username || '';
-      username.placeholder = '';
+      document.getElementById('tgToken').value = d.token || '';
+      document.getElementById('tgUsername').value = d.username || '';
       const chat = document.getElementById('tgChatId');
       chat.value = d.chat_id || '';
-      chat.placeholder = '';
       chat.readOnly = !!d.chat_locked;
       document.getElementById('tgModalStatus').textContent = JSON.stringify(d.status || {{}}, null, 2);
     }}
@@ -616,124 +940,83 @@ def index() -> str:
         body: JSON.stringify(payload),
       }});
       const d = await r.json();
-      if (!r.ok) {{
-        document.getElementById('tgModalStatus').textContent = JSON.stringify(d, null, 2);
-        return;
-      }}
       document.getElementById('tgModalStatus').textContent = JSON.stringify(d, null, 2);
-      await refreshVitals();
     }}
-    async function refreshVitals() {{
-      try {{
-        const r = await fetch('/api/vitals');
-        if (!r.ok) {{
-          throw new Error(`vitals http ${{r.status}}`);
-        }}
-        const d = await r.json();
-        document.getElementById('vitals').textContent = JSON.stringify(d, null, 2);
 
-        const performance = d.performance || {{}};
-        const telegram = d.telegram || {{}};
-        const canary = d.canary || {{}};
-
-        const pills = [];
-        const statusIcon = d.status === 'PASS' ? '🟢' : '🔴';
-        const modeLabel = canary.native_mode ? 'NATIVE' : (d.status || 'UNKNOWN');
-        const donorTag = canary.donor_addr ? ` [${{canary.donor_addr}}]` : '';
-        pills.push(`${{statusIcon}} ${{modeLabel}}${{donorTag}}`);
-        pills.push(`TPS~ ${{performance.tps_est ?? 'n/a'}}`);
-        pills.push(`VRAM: ${{d.vram || 'n/a'}}`);
-        pills.push(`Telegram: ${{telegram.indicator || '🔴'}}`);
-        pills.push(`Bias Applied: ${{canary.biases_applied_total ?? 0}}`);
-        if (canary.native_mode) {{
-          pills.push('native://gator_kern 🟢 ACTIVE');
-        }}
-        document.getElementById('tgStatusInline').textContent = `Telegram: ${{telegram.indicator || '🔴'}}`;
-        document.getElementById('pills').innerHTML = pills.map(p => `<span class=\"pill\">${{p}}</span>`).join('');
-      }} catch (err) {{
-        document.getElementById('vitals').textContent = `Vitals refresh error: ${{String(err)}}`;
-      }}
-    }}
-    async function refreshDebug() {{
-      const r = await fetch('/api/debug_tail');
-      const d = await r.json();
-      document.getElementById('debug').textContent = JSON.stringify(d, null, 2);
-    }}
-    async function refreshCronStatus() {{
-      try {{
-        const r = await fetch('/api/cron/status');
-        if (!r.ok) {{
-          throw new Error(`cron http ${{r.status}}`);
-        }}
-        const d = await r.json();
-        const badge = document.getElementById('cronBadge');
-        const enabled = !!d.enabled && !!d.alive;
-        badge.textContent = enabled ? `Cron: ON [pid=${{d.pid || 'n/a'}}]` : 'Cron: OFF';
-        document.getElementById('cronStatus').textContent = JSON.stringify(d, null, 2);
-      }} catch (err) {{
-        document.getElementById('cronStatus').textContent = `Cron refresh error: ${{String(err)}}`;
-      }}
-    }}
+    // ── Cron on/off (triggers HTMX reload after action) ────────
     async function setCronEnabled(enabled) {{
-      const endpoint = enabled ? '/api/cron/start' : '/api/cron/stop';
-      const r = await fetch(endpoint, {{ method: 'POST' }});
-      const d = await r.json();
-      document.getElementById('cronStatus').textContent = JSON.stringify(d, null, 2);
-      await refreshCronStatus();
+      await fetch(enabled ? '/api/cron/start' : '/api/cron/stop', {{ method: 'POST' }});
+      htmx.trigger(document.getElementById('cronBody'), 'load');
     }}
+
+    // ── Ingest bar (JS-driven for CSS width animation) ─────────
     let lastGraphRefreshTs = 0;
     function reloadGraphFrame() {{
       const frame = document.getElementById('graphFrame');
-      if (!frame) {{
-        return;
-      }}
-      const base = '/graph';
-      frame.src = `${{base}}?ts=${{Date.now()}}`;
+      if (frame) frame.src = '/graph?ts=' + Date.now();
     }}
     async function refreshIngestStatus() {{
       const r = await fetch('/api/ingest_status');
       const d = await r.json();
       document.getElementById('ingestPhase').textContent = d.state;
       document.getElementById('ingestPercent').textContent = d.percent || 0;
-      document.getElementById('ingestBar').style.width = `${{d.percent || 0}}%`;
+      document.getElementById('ingestBar').style.width = (d.percent || 0) + '%';
       document.getElementById('ingestStatus').textContent = JSON.stringify(d, null, 2);
       if (d.state === 'complete' && (d.updated_at || 0) > lastGraphRefreshTs) {{
         lastGraphRefreshTs = d.updated_at || Date.now() / 1000;
         reloadGraphFrame();
       }}
     }}
-    async function refreshHiveStatus() {{
+
+    // ── Persona Engine sliders ─────────────────────────────────
+    const TRAIT_KEYS = ['curiosity','directness','caution','creativity','empathy','precision'];
+    function updatePersonaLabel(slider, trait) {{
+      const pct = parseInt(slider.value);
+      const cap = trait.charAt(0).toUpperCase() + trait.slice(1);
+      document.getElementById('lbl' + cap).textContent = pct + '%';
+    }}
+    async function loadPersonaTraits() {{
       try {{
-        const r = await fetch('/api/hive/status');
-        if (!r.ok) {{
-          throw new Error(`hive http ${{r.status}}`);
-        }}
+        const r = await fetch('/api/persona');
         const d = await r.json();
-        if (!d.ok) {{
-          document.getElementById('hiveStatus').textContent = JSON.stringify(d, null, 2);
-          return;
-        }}
-
-        const hive = d.hive || {{}};
-        const prime = hive.prime || {{}};
-        const clones = Array.isArray(hive.clones) ? hive.clones : Object.values(hive.clones || {{}});
-        const lines = [];
-        lines.push(`Gator-Prime [${{prime.status || 'UNKNOWN'}}] VRAM=${{prime.vram_mib || 0}} MiB`);
-
-        const select = document.getElementById('cloneSelect');
-        select.innerHTML = '<option value="">-- Select a clone to decommission --</option>';
-        for (const node of clones) {{
-          lines.push(`${{node.name}} [${{node.status}}] VRAM=${{node.vram_mib || 0}} MiB`);
-          const opt = document.createElement('option');
-          opt.value = node.name;
-          opt.textContent = node.name;
-          select.appendChild(opt);
-        }}
-        document.getElementById('hiveStatus').textContent = lines.join(String.fromCharCode(10));
+        const traits = d.traits || {{}};
+        TRAIT_KEYS.forEach(k => {{
+          const el = document.getElementById('trait' + k.charAt(0).toUpperCase() + k.slice(1));
+          if (el) {{
+            const val = Math.round((traits[k] ?? 0.5) * 100);
+            el.value = val;
+            updatePersonaLabel(el, k);
+          }}
+        }});
+        const reflData = d.recent_reflections || [];
+        document.getElementById('personaReflections').textContent =
+          reflData.length ? JSON.stringify(reflData.slice(0,3), null, 2) : 'No reflections yet.';
       }} catch (err) {{
-        document.getElementById('hiveStatus').textContent = `Hive refresh error: ${{String(err)}}`;
+        document.getElementById('personaReflections').textContent = 'Load error: ' + String(err);
       }}
     }}
+    document.getElementById('personaSaveBtn').addEventListener('click', async () => {{
+      const updates = {{}};
+      TRAIT_KEYS.forEach(k => {{
+        const el = document.getElementById('trait' + k.charAt(0).toUpperCase() + k.slice(1));
+        if (el) updates[k] = parseInt(el.value) / 100;
+      }});
+      try {{
+        const r = await fetch('/api/persona', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{traits: updates}}),
+        }});
+        const d = await r.json();
+        document.getElementById('personaSaveStatus').textContent = d.ok ? 'saved' : 'error';
+        setTimeout(() => {{ document.getElementById('personaSaveStatus').textContent = 'idle'; }}, 2000);
+      }} catch (err) {{
+        document.getElementById('personaSaveStatus').textContent = 'err: ' + String(err);
+      }}
+    }});
+    document.getElementById('personaLoadBtn').addEventListener('click', loadPersonaTraits);
+
+    // ── Hive spawn / decommission ──────────────────────────────
     async function spawnClone() {{
       const name = document.getElementById('cloneName').value.trim();
       const r = await fetch('/api/hive/spawn', {{
@@ -743,22 +1026,10 @@ def index() -> str:
       }});
       const d = await r.json();
       document.getElementById('mitosisStatus').textContent = JSON.stringify(d, null, 2);
-      await refreshHiveStatus();
-    }}
-    function showDecommissionModal(cloneName) {{
-      document.getElementById('decommissionModal').style.display = 'flex';
-      document.getElementById('decommissionPrompt').textContent = `Decommission ${{cloneName}}?`;
-      document.getElementById('decommissionStatus').textContent = 'Ready to confirm.';
-      document.getElementById('decommissionConfirmBtn').dataset.cloneName = cloneName;
-    }}
-    function hideDecommissionModal() {{
-      document.getElementById('decommissionModal').style.display = 'none';
+      htmx.trigger(document.getElementById('hiveBody'), 'load');
     }}
     async function decommissionClone(cloneName) {{
-      if (!cloneName) {{
-        alert('Please select a clone to decommission.');
-        return;
-      }}
+      if (!cloneName) {{ alert('Please select a clone to decommission.'); return; }}
       const r = await fetch('/api/hive/decommission', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
@@ -766,53 +1037,24 @@ def index() -> str:
       }});
       const d = await r.json();
       document.getElementById('decommissionStatus').textContent = JSON.stringify(d, null, 2);
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(res => setTimeout(res, 1000));
       hideDecommissionModal();
       document.getElementById('cloneSelect').value = '';
-      await refreshHiveStatus();
+      htmx.trigger(document.getElementById('hiveBody'), 'load');
     }}
-    refreshVitals();
-    refreshDebug();
-    refreshIngestStatus();
-    refreshHiveStatus();
-    refreshCronStatus();
-    document.getElementById('interruptBtn').addEventListener('click', async () => {{
-      const r = await fetch('/api/interrupt', {{ method: 'POST' }});
-      const d = await r.json();
-      alert('Interrupt sent: ' + JSON.stringify(d));
-      refreshVitals();
-    }});
+
+    // ── Event listeners ────────────────────────────────────────
     document.getElementById('setupTelegramBtn').addEventListener('click', async () => {{
-      showModal();
-      await loadTelegramConfig();
+      showModal(); await loadTelegramConfig();
     }});
-    document.getElementById('tgCloseBtn').addEventListener('click', () => {{
-      hideModal();
-    }});
-    document.getElementById('tgSaveBtn').addEventListener('click', async () => {{
-      await saveTelegramConfig();
-    }});
-    document.getElementById('mitosisBtn').addEventListener('click', async () => {{
+    document.getElementById('tgCloseBtn').addEventListener('click', hideModal);
+    document.getElementById('tgSaveBtn').addEventListener('click', saveTelegramConfig);
+    document.getElementById('mitosisBtn').addEventListener('click', () => {{
       showMitosisModal();
       document.getElementById('mitosisStatus').textContent = 'Enter name for New Worker Node:';
     }});
-    document.getElementById('cloneCloseBtn').addEventListener('click', () => {{
-      hideMitosisModal();
-    }});
-    document.getElementById('sessionResetBtn').addEventListener('click', async () => {{
-      const r = await fetch('/api/session_reset', {{ method: 'POST' }});
-      const d = await r.json();
-      alert('Session Reset: ' + JSON.stringify(d));
-    }});
-    document.getElementById('cloneSpawnBtn').addEventListener('click', async () => {{
-      await spawnClone();
-    }});
-    document.getElementById('cronOnBtn').addEventListener('click', async () => {{
-      await setCronEnabled(true);
-    }});
-    document.getElementById('cronOffBtn').addEventListener('click', async () => {{
-      await setCronEnabled(false);
-    }});
+    document.getElementById('cloneCloseBtn').addEventListener('click', hideMitosisModal);
+    document.getElementById('cloneSpawnBtn').addEventListener('click', spawnClone);
     document.getElementById('ingestBtn').addEventListener('click', async () => {{
       const pdfPath = document.getElementById('pdfPath').value.trim();
       const r = await fetch('/api/ingest_pdf', {{
@@ -824,31 +1066,25 @@ def index() -> str:
       document.getElementById('ingestStatus').textContent = JSON.stringify(d, null, 2);
       refreshIngestStatus();
     }});
-    setInterval(refreshVitals, 7000);
-    setInterval(refreshDebug, 9000);
-    setInterval(refreshIngestStatus, 1500);
-    setInterval(refreshHiveStatus, 2500);
-    setInterval(refreshCronStatus, 2500);
     document.getElementById('decommissionBtn').addEventListener('click', () => {{
       const cloneName = document.getElementById('cloneSelect').value;
-      if (!cloneName) {{
-        alert('Please select a clone to decommission.');
-        return;
-      }}
+      if (!cloneName) {{ alert('Please select a clone to decommission.'); return; }}
       showDecommissionModal(cloneName);
     }});
-    document.getElementById('decommissionCancelBtn').addEventListener('click', () => {{
-      hideDecommissionModal();
-    }});
+    document.getElementById('decommissionCancelBtn').addEventListener('click', hideDecommissionModal);
     document.getElementById('decommissionConfirmBtn').addEventListener('click', async () => {{
       const cloneName = document.getElementById('decommissionConfirmBtn').dataset.cloneName;
       await decommissionClone(cloneName);
     }});
+
+    // ── Init ───────────────────────────────────────────────────
+    loadPersonaTraits();
+    refreshIngestStatus();
+    setInterval(refreshIngestStatus, 1500);
+    // Vitals, cron, hive, debug, tools stream, vram — all driven by HTMX hx-trigger="load, every Xs"
   </script>
 </body>
 </html>"""
-
-
 @app.get("/graph", response_class=HTMLResponse)
 def graph_page() -> HTMLResponse:
     if not GRAPH_HTML.exists():
