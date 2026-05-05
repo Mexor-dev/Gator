@@ -790,7 +790,7 @@ def index() -> str:
         <button id="mitosisBtn"
                 title="Spawn a 35B Worker clone (capped at 2228 MiB VRAM, 6x density)"
                 disabled
-                style="background:#1b6b3a;opacity:0.5;cursor:not-allowed">🧬 Spawn 35B Worker</button>
+                style="background:#1b6b3a;opacity:0.5;cursor:not-allowed">Spawn</button>
         <span id="greenlightPill" class="pill"
               hx-get="/htmx/greenlight"
               hx-trigger="load, every 6s"
