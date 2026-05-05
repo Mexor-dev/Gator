@@ -232,6 +232,7 @@ build_native_kernel() {
 
 ensure_logic_map() {
   local count=0
+  local rebuilt="false"
 
   if [[ ! -f "$LOGIC_GATE" ]]; then
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -264,12 +265,50 @@ PY
   fi
 
   if (( count < LOGIC_MIN_RECORDS )); then
-    if [[ "$STRICT_LOGIC_GATE" == "true" ]]; then
-      fatal "logic_map.gate has ${count} records (< ${LOGIC_MIN_RECORDS}); run run_extraction.sh or set GATOR_STRICT_LOGIC_GATE=false"
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log "[dry-run] logic_map.gate has ${count} records (< ${LOGIC_MIN_RECORDS}); would run run_extraction.sh"
+      return 0
     fi
-    log "WARNING: logic_map.gate has ${count} records (< ${LOGIC_MIN_RECORDS}); extraction is recommended for full donor fidelity"
+
+    [[ -x "$ROOT/run_extraction.sh" || -f "$ROOT/run_extraction.sh" ]] || fatal "Missing run_extraction.sh"
+    log "logic_map.gate has ${count} records (< ${LOGIC_MIN_RECORDS}); running extraction to rebuild"
+    bash "$ROOT/run_extraction.sh"
+    rebuilt="true"
+
+    count="$("$VENV/bin/python" - <<'PY'
+import gzip
+import pickle
+from pathlib import Path
+
+gate = Path("bin/logic_map.gate")
+try:
+    data = pickle.loads(gzip.decompress(gate.read_bytes()))
+except Exception:
+    print(-1)
+else:
+    print(len(data.get("records", [])) if isinstance(data, dict) else -1)
+PY
+)"
+
+    if [[ "$count" == "-1" ]]; then
+      fatal "logic_map.gate rebuild produced unreadable/corrupt output"
+    fi
+
+    if (( count < LOGIC_MIN_RECORDS )) && [[ "$STRICT_LOGIC_GATE" == "true" ]]; then
+      fatal "logic_map.gate rebuild still has ${count} records (< ${LOGIC_MIN_RECORDS}); set GATOR_STRICT_LOGIC_GATE=false to bypass"
+    fi
+
+    if (( count < LOGIC_MIN_RECORDS )); then
+      log "WARNING: logic_map.gate rebuild has ${count} records (< ${LOGIC_MIN_RECORDS}); continuing because STRICT_LOGIC_GATE=false"
+    else
+      log "logic_map.gate rebuild OK: ${count} records"
+    fi
   else
     log "logic_map.gate quality OK: ${count} records"
+  fi
+
+  if [[ "$rebuilt" == "true" ]]; then
+    log "logic_map.gate regeneration complete"
   fi
 }
 
