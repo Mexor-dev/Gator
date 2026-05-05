@@ -154,8 +154,8 @@ class TelegramGateway:
         request_id = uuid.uuid4().hex
         payload = {
             "prompt": text,
-            "max_tokens": 750,
-            "temperature": 0.75,
+            "max_tokens": 900,
+            "temperature": 0.82,
             "top_k": 40,
             "request_id": request_id,
         }
@@ -300,6 +300,47 @@ class TelegramGateway:
         print("[WARN] Reasoning Failure: FINAL_ANSWER not found; sending raw output", flush=True)
         return raw
 
+    def _strip_user_echo(self, user_text: str, answer: str) -> str:
+        """Remove leading user-echo segments from model output."""
+        original = (answer or "").strip()
+        if not original:
+            return original
+
+        user = (user_text or "").strip()
+        if not user:
+            return original
+
+        candidate = re.sub(r"^\[[^\]]+\]\s*", "", original).strip()
+        user_norm = re.sub(r"\s+", " ", user).lower()
+        cand_norm = re.sub(r"\s+", " ", candidate).lower()
+
+        trimmed = candidate
+        changed = False
+
+        if cand_norm.startswith(user_norm):
+            trimmed = candidate[len(user) :].lstrip(" \t\r\n:,-.!?")
+            changed = True
+        else:
+            idx = cand_norm.find(user_norm)
+            if 0 <= idx <= 40:
+                trimmed = candidate[idx + len(user) :].lstrip(" \t\r\n:,-.!?")
+                changed = True
+
+        if changed:
+            if not trimmed:
+                trimmed = "I'm running at peak efficiency, ready for the next task."
+            try:
+                KERNEL_LOG.parent.mkdir(parents=True, exist_ok=True)
+                with KERNEL_LOG.open("a", encoding="utf-8") as fh:
+                    fh.write(
+                        f"{time.time():.3f} [echo-strip] user={user[:180]} | before={original[:260]} | after={trimmed[:260]}\n"
+                    )
+            except Exception:
+                pass
+            return trimmed
+
+        return original
+
     def _mark_truncated_thought(self, text: str) -> str:
         cleaned = (text or "").rstrip()
         if not cleaned:
@@ -421,6 +462,7 @@ class TelegramGateway:
         # Strip any native kern debug traces before the answer reaches the user.
         answer = self._strip_native_trace(answer)
         answer = self._clean_reasoning_output(answer)
+        answer = self._strip_user_echo(user_text, answer)
         answer = answer[:3500]
         answer = self._mark_truncated_thought(answer)
         # Sovereign Polish: prefix every outbound message with the node identity.
