@@ -37,6 +37,8 @@ PIPER_MODEL = GATOR_ROOT / "models" / "tts" / "en_GB-alba-medium.onnx"
 PIPER_MODEL_CONFIG = GATOR_ROOT / "models" / "tts" / "en_GB-alba-medium.onnx.json"
 TTS_TMP_DIR = GATOR_ROOT / "tmp" / "tts"
 STOP = False
+NATIVE_LOG = GATOR_ROOT / "logs" / "native.log"
+_TRACE_PAT = re.compile(r"\[gator_kern native trace:[^\]]*\]")
 DNS_FALLBACK_HOST = "api.telegram.org"
 DNS_FALLBACK_SERVERS = ["1.1.1.1", "8.8.8.8"]
 
@@ -135,7 +137,7 @@ class TelegramGateway:
         self.bridge_url = bridge_url
         self.voice_enabled = True
 
-    async def _ask_gator(self, text: str) -> tuple[str, bool]:
+    async def _ask_gator(self, text: str) -> tuple[str, str, bool]:
         request_id = uuid.uuid4().hex
         payload = {
             "prompt": text,
@@ -179,12 +181,13 @@ class TelegramGateway:
 
         data = await bridge_task
         fallback = str(data.get("text") or data.get("output") or data.get("response") or "")
+        entity_name = str(data.get("entity_name") or data.get("identity") or "Gator-Prime")
         if not saw_final:
-            return "", False
+            return "", entity_name, False
 
         if buffer.strip():
-            return buffer.strip(), True
-        return fallback.strip(), True
+            return buffer.strip(), entity_name, True
+        return fallback.strip(), entity_name, True
 
     def _authorized(self, update: Update) -> bool:
         msg = update.message
@@ -199,6 +202,22 @@ class TelegramGateway:
         await bot.send_message(chat_id=chat_id, text=message_text)
         if self.voice_enabled:
             asyncio.create_task(self._send_voice_only(bot, chat_id, message_text))
+
+    def _strip_native_trace(self, text: str) -> str:
+        """Second-line defence: strip any kern trace that escaped the bridge filter.
+
+        Redirects matched fragments to logs/native.log for diagnostics.
+        """
+        traces = _TRACE_PAT.findall(text or "")
+        if traces:
+            try:
+                NATIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
+                with NATIVE_LOG.open("a", encoding="utf-8") as fh:
+                    for fragment in traces:
+                        fh.write(f"{time.time():.3f} [tg-filter] {fragment}\n")
+            except Exception:
+                pass
+        return _TRACE_PAT.sub("", text or "").strip()
 
     def _clean_reasoning_output(self, text: str) -> str:
         raw = (text or "").strip()
@@ -353,15 +372,20 @@ class TelegramGateway:
         user_text = (update.message.text or "").strip()
         if not user_text:
             return
-        answer, saw_final = await self._ask_gator(user_text)
+        answer, entity_name, saw_final = await self._ask_gator(user_text)
         if not saw_final:
             print("[WARN] Skipping Telegram send: final packet not observed", flush=True)
             return
         if not answer:
             answer = "No response from Gator bridge."
+        # Strip any native kern debug traces before the answer reaches the user.
+        answer = self._strip_native_trace(answer)
         answer = self._clean_reasoning_output(answer)
         answer = answer[:3500]
         answer = self._mark_truncated_thought(answer)
+        # Sovereign Polish: prefix every outbound message with the node identity.
+        label = f"[{entity_name}]"
+        answer = f"{label} {answer}" if answer and not answer.startswith(label) else answer
         await self._send_text_and_voice(context.bot, update.effective_chat.id, answer)
         answer = ""
 

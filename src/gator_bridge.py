@@ -27,6 +27,17 @@ from persona_engine import PersonaEngine
 
 GATOR_ROOT = Path(__file__).resolve().parents[1]
 GATE_PATH = GATOR_ROOT / "bin" / "logic_map.gate"
+NATIVE_LOG = GATOR_ROOT / "logs" / "native.log"
+
+
+def _write_native_log(line: str) -> None:
+    """Append a native-kern trace line to logs/native.log (never reaches users)."""
+    try:
+        NATIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with NATIVE_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.time():.3f} {line}\n")
+    except Exception:
+        pass
 
 SYSTEM_IDENTITY = "cpp_rtx_direct"
 
@@ -98,10 +109,11 @@ class InferenceEngine:
         marker = "User request:\n"
         if marker in user_prompt:
             user_section = user_prompt.split(marker, 1)[1]
-        return (
-            f"{user_section.strip()[:700]}\n\n"
+        # Redirect native trace to logs/native.log — must never surface to users.
+        _write_native_log(
             f"[gator_kern native trace: donor=0x{singleton_addr:x}, tokens={sampled[:6]}]"
-        ).strip()
+        )
+        return user_section.strip()[:700]
 
 
 class GatorBridge:
@@ -248,13 +260,19 @@ class GatorBridge:
     ) -> str:
         mc = self._get_memory_core()
         scratch = mc.retrieve_context(session_id=session_id, current_step=1)
+        # Persona steering is applied to both donor AND mouthpiece so trait sliders
+        # govern the full output, not just the internal reasoning pass.
+        steering = self.persona.build_steering_fragment()
+        effective_mouthpiece_prompt = (
+            f"{steering}\n\n{MOUTHPIECE_PROMPT}" if steering else MOUTHPIECE_PROMPT
+        )
         user_prompt = (
             "Use only the scratchpad context below to answer the user.\n\n"
             f"Scratchpad:\n{scratch}\n\n"
             f"User request:\n{prompt}"
         )
         text = self._chat_completion(
-            system_prompt=MOUTHPIECE_PROMPT,
+            system_prompt=effective_mouthpiece_prompt,
             user_prompt=user_prompt,
             max_tokens=max_tokens,
             temperature=max(0.05, temperature),
