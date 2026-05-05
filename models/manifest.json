@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "logic_donor_35b_class",
+      "role": "logic_donor",
+      "description": "35B-class logic donor (default: Qwen2.5 32B Instruct Q4_K_M)",
+      "url": "https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/main/Qwen2.5-32B-Instruct-Q4_K_M.gguf",
+      "target_file": "donor.gguf",
+      "sha256": "f7acfc3c2a65bd42c4930f62ee7fdb07c42ea926f2cf53b56581b97eb1767709"
+    },
+    {
+      "id": "chassis_1_5b",
+      "role": "chassis",
+      "description": "1.5B chassis model (Qwen2.5 1.5B Instruct Q4_K_M)",
+      "url": "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+      "target_file": "chassis.gguf",
+      "sha256": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e"
+    }
+  ]
+}

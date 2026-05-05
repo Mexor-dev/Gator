@@ -1,32 +1,98 @@
+# =============================================================================
+# GATOR - SOVEREIGN ENTITY .gitignore
+# CRITICAL: Model files are 14-18GB. They MUST NEVER be committed.
+# =============================================================================
+
+# -- MODEL FILES (CRITICAL) ---------------------------------------------------
+*.gguf
+*.ggml
+*.onnx
+*.onnx.json
+models/tts/
+models/voice/
+# models/manifest.json is intentionally tracked (procurement spec, no weights)
+
+# -- PYTHON RUNTIME -----------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
 venv/
+.venv/
+env/
+*.egg-info/
+dist/
+*.egg
+pip-log.txt
+
+# -- COMPILED NATIVE KERNEL ---------------------------------------------------
+*.so
+*.a
+*.o
+*.lo
+*.la
+
+# -- CMAKE BUILD ARTIFACTS ----------------------------------------------------
 build/
+.bootstrap_build/
+.bootstrap_cache/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+
+# -- ENVIRONMENT & SECRETS ----------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets/
+
+# -- LANCEDB RUNTIME DATA -----------------------------------------------------
 db/
-logs/
-tmp/
-graphify-out/
-research/graphify-out/
-research/scholar_sense/
-models/*.gguf
-models/**/*.gguf
-models/*.bin
-models/**/*.bin
-models/
+*.lance/
+
+# -- RUNTIME STATE FILES ------------------------------------------------------
 bin/*.pid
-bin/maintenance_state.json
+bin/agentic_cron_state.json
 bin/hive_state.json
-bin/logic_map.gate
-bin/hive_nodes/
-bin/gator_map/
+bin/maintenance_state.json
+
+# -- RUNTIME BINARIES (pre-compiled, not source) ------------------------------
 bin/piper
 bin/piper_runtime/
-__pycache__/
-src/__pycache__/
-src/**/__pycache__/
-tests/__pycache__/
-*.pyc
-*.pyo
-*.pdf
-*.so
-*.gguf
-.env
-node_registry.json
+
+# -- SNAPSHOTS & GATOR MAP (generated) ----------------------------------------
+bin/gator_map/
+bin/hive_nodes/
+
+# -- LOG FILES ----------------------------------------------------------------
+logs/
+*.log
+debug.json
+
+# -- RESEARCH RUNTIME DATA ----------------------------------------------------
+research/graphify-out/
+research/scholar_sense/hybrid_registry.db
+research/scholar_sense/node_registry.json
+graphify-out/
+
+# -- PERSONA RUNTIME STATE ----------------------------------------------------
+config/persona_traits.json
+
+# -- SQLITE DATABASES ---------------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+
+# -- AUDIO ARTIFACTS ----------------------------------------------------------
+*.wav
+
+# -- EDITOR / OS NOISE --------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
