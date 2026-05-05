@@ -39,6 +39,7 @@ TTS_TMP_DIR = GATOR_ROOT / "tmp" / "tts"
 VOICE_STATUS_FILE = GATOR_ROOT / "logs" / "voice_status.json"
 STOP = False
 NATIVE_LOG = GATOR_ROOT / "logs" / "native.log"
+KERNEL_LOG = GATOR_ROOT / "logs" / "kernel.log"
 _TRACE_PAT = re.compile(r"\[gator_kern native trace:[^\]]*\]")
 DNS_FALLBACK_HOST = "api.telegram.org"
 DNS_FALLBACK_SERVERS = ["1.1.1.1", "8.8.8.8"]
@@ -208,12 +209,38 @@ class TelegramGateway:
         return str(msg.chat.id) == self.auth_chat_id
 
     async def _send_text_and_voice(self, bot: Any, chat_id: int, text: str) -> None:
-        message_text = (text or "").strip()
+        message_text = self._sanitize_outbound_text(text or "", source="send_text")
         if not message_text:
             return
         await bot.send_message(chat_id=chat_id, text=message_text)
         if self.voice_enabled:
             asyncio.create_task(self._send_voice_only(bot, chat_id, message_text))
+
+    def _sanitize_outbound_text(self, text: str, *, source: str) -> str:
+        """Emergency guardrail: never allow native traces into user-visible channels.
+
+        If a native trace marker appears, strip all text from marker onward and
+        redirect stripped content to logs/kernel.log for developer monitoring.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+
+        marker = "[gator_kern"
+        lower_raw = raw.lower()
+        marker_idx = lower_raw.find(marker)
+        if marker_idx >= 0:
+            cleaned = raw[:marker_idx].strip()
+            stripped = raw[marker_idx:].strip()
+            try:
+                KERNEL_LOG.parent.mkdir(parents=True, exist_ok=True)
+                with KERNEL_LOG.open("a", encoding="utf-8") as fh:
+                    fh.write(f"{time.time():.3f} [{source}] stripped={stripped}\n")
+            except Exception:
+                pass
+            return cleaned
+
+        return self._strip_native_trace(raw)
 
     def _strip_native_trace(self, text: str) -> str:
         """Second-line defence: strip any kern trace that escaped the bridge filter.
@@ -308,6 +335,7 @@ class TelegramGateway:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="Voice output unmuted. Text + voice replies are active.")
 
     def synthesize_speech(self, text: str) -> Path | None:
+        text = self._sanitize_outbound_text(text, source="tts")
         if not text.strip():
             return None
         if not PIPER_BIN.exists() or not PIPER_MODEL.exists() or not PIPER_MODEL_CONFIG.exists():
