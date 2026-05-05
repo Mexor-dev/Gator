@@ -177,6 +177,7 @@ class AgenticCronRunner:
             "defrag": 0.0,
             "architect": 0.0,
         }
+        self.last_results: dict[str, Any] = {}
 
     def _handle_signal(self, _signum: int, _frame: Any) -> None:
         self.running = False
@@ -204,20 +205,7 @@ class AgenticCronRunner:
                 break
 
             now = time.time()
-            results: dict[str, Any] = {}
-
-            if now - self.last_run["dream"] >= int(state.get("dream_every_seconds", 120)):
-                results["dream"] = self._run_task("dream", state)
-                self.last_run["dream"] = now
-            if now - self.last_run["process_dream"] >= int(state.get("process_dream_every_seconds", 180)):
-                results["process_dream"] = self._run_task("process_dream", state)
-                self.last_run["process_dream"] = now
-            if now - self.last_run["defrag"] >= int(state.get("defrag_every_seconds", 300)):
-                results["defrag"] = self._run_task("defrag", state)
-                self.last_run["defrag"] = now
-            if now - self.last_run["architect"] >= int(state.get("architect_every_seconds", 420)):
-                results["architect"] = self._run_task("architect", state)
-                self.last_run["architect"] = now
+            cycle_results: dict[str, Any] = {}
 
             _write_status(
                 {
@@ -225,8 +213,80 @@ class AgenticCronRunner:
                     "enabled": True,
                     "pid": os.getpid(),
                     "updated_at": now,
-                    "last_results": results,
+                    "last_results": self.last_results,
                     "schedule": state,
+                    "current_task": None,
+                }
+            )
+
+            if now - self.last_run["dream"] >= int(state.get("dream_every_seconds", 120)):
+                _write_status(
+                    {
+                        "state": "running",
+                        "enabled": True,
+                        "pid": os.getpid(),
+                        "updated_at": time.time(),
+                        "last_results": self.last_results,
+                        "schedule": state,
+                        "current_task": "dream",
+                    }
+                )
+                cycle_results["dream"] = self._run_task("dream", state)
+                self.last_run["dream"] = now
+            if now - self.last_run["process_dream"] >= int(state.get("process_dream_every_seconds", 180)):
+                _write_status(
+                    {
+                        "state": "running",
+                        "enabled": True,
+                        "pid": os.getpid(),
+                        "updated_at": time.time(),
+                        "last_results": self.last_results,
+                        "schedule": state,
+                        "current_task": "process_dream",
+                    }
+                )
+                cycle_results["process_dream"] = self._run_task("process_dream", state)
+                self.last_run["process_dream"] = now
+            if now - self.last_run["defrag"] >= int(state.get("defrag_every_seconds", 300)):
+                _write_status(
+                    {
+                        "state": "running",
+                        "enabled": True,
+                        "pid": os.getpid(),
+                        "updated_at": time.time(),
+                        "last_results": self.last_results,
+                        "schedule": state,
+                        "current_task": "defrag",
+                    }
+                )
+                cycle_results["defrag"] = self._run_task("defrag", state)
+                self.last_run["defrag"] = now
+            if now - self.last_run["architect"] >= int(state.get("architect_every_seconds", 420)):
+                _write_status(
+                    {
+                        "state": "running",
+                        "enabled": True,
+                        "pid": os.getpid(),
+                        "updated_at": time.time(),
+                        "last_results": self.last_results,
+                        "schedule": state,
+                        "current_task": "architect",
+                    }
+                )
+                cycle_results["architect"] = self._run_task("architect", state)
+                self.last_run["architect"] = now
+
+            self.last_results.update(cycle_results)
+
+            _write_status(
+                {
+                    "state": "running",
+                    "enabled": True,
+                    "pid": os.getpid(),
+                    "updated_at": now,
+                    "last_results": self.last_results,
+                    "schedule": state,
+                    "current_task": None,
                 }
             )
             time.sleep(max(1, int(state.get("interval_seconds", 15))))
