@@ -15,6 +15,7 @@ HTMX_VENDOR_DIR="$ROOT/src/interfaces/static/vendor"
 HTMX_VENDOR_FILE="$HTMX_VENDOR_DIR/htmx.min.js"
 VRAM_TARGET_MIB="${GATOR_VRAM_TARGET_MIB:-2228}"
 LOGIC_MIN_RECORDS="${GATOR_MIN_LOGIC_RECORDS:-100}"
+STRICT_LOGIC_GATE="${GATOR_STRICT_LOGIC_GATE:-true}"
 DRY_RUN="false"
 SETUP_LOG="$CACHE_DIR/bootstrap_setup.log"
 
@@ -263,6 +264,9 @@ PY
   fi
 
   if (( count < LOGIC_MIN_RECORDS )); then
+    if [[ "$STRICT_LOGIC_GATE" == "true" ]]; then
+      fatal "logic_map.gate has ${count} records (< ${LOGIC_MIN_RECORDS}); run run_extraction.sh or set GATOR_STRICT_LOGIC_GATE=false"
+    fi
     log "WARNING: logic_map.gate has ${count} records (< ${LOGIC_MIN_RECORDS}); extraction is recommended for full donor fidelity"
   else
     log "logic_map.gate quality OK: ${count} records"
