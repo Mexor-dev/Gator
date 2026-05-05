@@ -2,40 +2,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-VENV="$ROOT/venv"
-REQ="$ROOT/requirements.txt"
-BUILD_DIR="$ROOT/build"
 ENV_FILE="$ROOT/.env"
 
-detect_backend() {
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    echo cuda
-    return
-  fi
-  if command -v rocminfo >/dev/null 2>&1; then
-    echo rocm
-    return
-  fi
-  if command -v sycl-ls >/dev/null 2>&1; then
-    echo oneapi
-    return
-  fi
-  echo cpu
-}
-
-BACKEND="$(detect_backend)"
-echo "[INFO] backend=$BACKEND"
-
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "[FATAL] python3 is required"
+if [[ ! -x "$ROOT/bootstrap.sh" && ! -f "$ROOT/bootstrap.sh" ]]; then
+  echo "[FATAL] bootstrap.sh missing at $ROOT/bootstrap.sh"
   exit 1
 fi
 
-python3 -m venv "$VENV"
-"$VENV/bin/python" -m pip install --upgrade pip
-"$VENV/bin/pip" install -r "$REQ"
-"$VENV/bin/pip" uninstall -y llama-cpp-python >/dev/null 2>&1 || true
-rm -f "$ROOT/bin/llama-server" "$ROOT/bin/llama-cli" 2>/dev/null || true
+echo "[INFO] running bootstrap pipeline (models + kernel + logic gate + scrub + wakeup validation)"
+bash "$ROOT/bootstrap.sh"
 
 if [[ -z "${GATOR_TG_BOT_TOKEN:-}" ]] || [[ -z "${GATOR_TG_AUTH_CHAT_ID:-}" ]]; then
   echo "[INFO] Telegram hive gateway can be configured now or later via .env"
@@ -59,17 +34,4 @@ if [[ -n "${GATOR_TG_AUTH_CHAT_ID:-}" ]]; then
   grep -q '^GATOR_TG_AUTH_CHAT_ID=' "$ENV_FILE" 2>/dev/null && sed -i "s|^GATOR_TG_AUTH_CHAT_ID=.*|GATOR_TG_AUTH_CHAT_ID=${GATOR_TG_AUTH_CHAT_ID}|" "$ENV_FILE" || echo "GATOR_TG_AUTH_CHAT_ID=${GATOR_TG_AUTH_CHAT_ID}" >> "$ENV_FILE"
 fi
 
-cmake -S "$ROOT" -B "$BUILD_DIR"
-cmake --build "$BUILD_DIR" --target gator_kern
-
-if [[ -f "$BUILD_DIR/src/inference/libgator_kern.so" ]]; then
-  cp "$BUILD_DIR/src/inference/libgator_kern.so" "$ROOT/src/inference/libgator_kern.so"
-elif [[ -f "$BUILD_DIR/libgator_kern.so" ]]; then
-  cp "$BUILD_DIR/libgator_kern.so" "$ROOT/src/inference/libgator_kern.so"
-fi
-
-"$VENV/bin/python" "$ROOT/src/core/gator_map.py" --snapshot --reason install_bootstrap
-
-GATOR_DAEMON=true "$ROOT/wakeup"
-
-echo "[OK] Project Gator installed and wakeup sequence started"
+echo "[OK] Project Gator installed via bootstrap pipeline"

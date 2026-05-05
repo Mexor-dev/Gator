@@ -4,8 +4,8 @@
     {
       "id": "logic_donor_35b_class",
       "role": "logic_donor",
-      "description": "35B-class logic donor (default: Qwen2.5 32B Instruct Q4_K_M)",
-      "url": "https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/main/Qwen2.5-32B-Instruct-Q4_K_M.gguf",
+      "description": "35B-class logic donor (default: Qwen2.5 32B Instruct Q3_K_M)",
+      "url": "https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/main/Qwen2.5-32B-Instruct-Q3_K_M.gguf",
       "target_file": "donor.gguf",
       "sha256": "f7acfc3c2a65bd42c4930f62ee7fdb07c42ea926f2cf53b56581b97eb1767709"
     },

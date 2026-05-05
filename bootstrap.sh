@@ -10,9 +10,11 @@ CACHE_DIR="$ROOT/.bootstrap_cache"
 BUILD_DIR="$ROOT/.bootstrap_build"
 HEADERS_DIR="$BUILD_DIR/llama_headers"
 KERN_OUT="$ROOT/src/inference/libgator_kern.so"
+LOGIC_GATE="$ROOT/bin/logic_map.gate"
 HTMX_VENDOR_DIR="$ROOT/src/interfaces/static/vendor"
 HTMX_VENDOR_FILE="$HTMX_VENDOR_DIR/htmx.min.js"
 VRAM_TARGET_MIB="${GATOR_VRAM_TARGET_MIB:-2228}"
+LOGIC_MIN_RECORDS="${GATOR_MIN_LOGIC_RECORDS:-100}"
 DRY_RUN="false"
 SETUP_LOG="$CACHE_DIR/bootstrap_setup.log"
 
@@ -228,18 +230,51 @@ build_native_kernel() {
 }
 
 ensure_logic_map() {
-  local gate="$ROOT/bin/logic_map.gate"
-  if [[ -f "$gate" ]]; then
-    return 0
+  local count=0
+
+  if [[ ! -f "$LOGIC_GATE" ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log "[dry-run] missing logic_map.gate would trigger run_extraction.sh"
+      return 0
+    fi
+    [[ -x "$ROOT/run_extraction.sh" || -f "$ROOT/run_extraction.sh" ]] || fatal "Missing run_extraction.sh"
+    log "logic_map.gate missing; running extraction"
+    bash "$ROOT/run_extraction.sh"
+    [[ -f "$LOGIC_GATE" ]] || fatal "Extraction did not produce $LOGIC_GATE"
   fi
+
+  count="$("$VENV/bin/python" - <<'PY'
+import gzip
+import pickle
+from pathlib import Path
+
+gate = Path("bin/logic_map.gate")
+try:
+    data = pickle.loads(gzip.decompress(gate.read_bytes()))
+except Exception:
+    print(-1)
+else:
+    print(len(data.get("records", [])) if isinstance(data, dict) else -1)
+PY
+)"
+
+  if [[ "$count" == "-1" ]]; then
+    fatal "logic_map.gate exists but is unreadable/corrupt"
+  fi
+
+  if (( count < LOGIC_MIN_RECORDS )); then
+    log "WARNING: logic_map.gate has ${count} records (< ${LOGIC_MIN_RECORDS}); extraction is recommended for full donor fidelity"
+  else
+    log "logic_map.gate quality OK: ${count} records"
+  fi
+}
+
+snapshot_logic_map() {
   if [[ "$DRY_RUN" == "true" ]]; then
-    log "[dry-run] missing logic_map.gate would trigger run_extraction.sh"
+    log "[dry-run] gator_map snapshot skipped"
     return 0
   fi
-  [[ -x "$ROOT/run_extraction.sh" || -f "$ROOT/run_extraction.sh" ]] || fatal "Missing run_extraction.sh"
-  log "logic_map.gate missing; running extraction"
-  bash "$ROOT/run_extraction.sh"
-  [[ -f "$gate" ]] || fatal "Extraction did not produce $gate"
+  "$VENV/bin/python" "$ROOT/src/core/gator_map.py" --snapshot --reason bootstrap
 }
 
 scrub_install_waste() {
@@ -262,6 +297,7 @@ scrub_install_waste() {
   # Keep production artifacts only.
   [[ -f "$MODELS_DIR/donor.gguf" ]] || fatal "Missing donor.gguf after scrub"
   [[ -f "$MODELS_DIR/chassis.gguf" ]] || fatal "Missing chassis.gguf after scrub"
+  [[ -f "$LOGIC_GATE" ]] || fatal "Missing logic_map.gate after scrub"
   [[ -f "$KERN_OUT" ]] || fatal "Missing production kernel after scrub"
 }
 
@@ -276,7 +312,17 @@ validate_runtime() {
   GATOR_DAEMON=true "$ROOT/wakeup" >/dev/null 2>"$CACHE_DIR/wakeup.stderr.log"
 
   for _ in $(seq 1 60); do
-    if curl -sSf "http://127.0.0.1:8080/api/health" >/dev/null 2>&1; then
+    if curl -sSf "http://127.0.0.1:8080/api/health" | "$VENV/bin/python" - <<'PY' >/dev/null 2>&1
+import json
+import sys
+payload = json.load(sys.stdin)
+ok = payload.get("ok")
+status = str(payload.get("status", "")).lower()
+if ok is True or status == "ok":
+    sys.exit(0)
+sys.exit(1)
+PY
+    then
       break
     fi
     sleep 1
@@ -313,6 +359,7 @@ main() {
   fetch_minimal_llama_headers
   build_native_kernel
   ensure_logic_map
+  snapshot_logic_map
   scrub_install_waste
   validate_runtime
 
