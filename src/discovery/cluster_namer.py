@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from hybrid_memory import HybridMemoryStore
+
 GATOR_ROOT = Path(__file__).resolve().parents[2]
 RESEARCH_ROOT = GATOR_ROOT / "research"
 GRAPH_JSON = RESEARCH_ROOT / "graphify-out" / "graph.json"
@@ -48,6 +50,7 @@ class ClusterNamer:
         self.graph_json = graph_json
         self.registry_file = registry_file
         self.bridge_url = bridge_url
+        self.hybrid = HybridMemoryStore(server_url="native://gator_kern")
 
     def _community_id(self, value: Any) -> int:
         if value is None or value == "":
@@ -235,12 +238,24 @@ class ClusterNamer:
                     ],
                 }
 
+            snippets = [self._snippet_for_node(node) for node in nodes[:12]]
+            vector_row_id = self.hybrid.index_community_label(
+                community_id=community_id,
+                label=communities[key]["label"],
+                signature=signature,
+                node_count=len(nodes),
+                update_reason=str(communities[key].get("update_reason") or update_reason),
+                snippets=snippets,
+            )
+            communities[key]["vector_row_id"] = vector_row_id
+
             out[community_id] = {
                 "label": communities[key]["label"],
                 "signature": signature,
                 "node_count": len(nodes),
                 "update_reason": communities[key].get("update_reason", update_reason),
                 "updated_at": communities[key].get("updated_at", time.time()),
+                "vector_row_id": communities[key].get("vector_row_id"),
             }
 
         stale_keys = [key for key in communities if int(key) not in grouped]
@@ -252,6 +267,9 @@ class ClusterNamer:
         registry["updated_at"] = time.time()
         self._save_registry(registry)
         return out
+
+    def semantic_lookup(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        return self.hybrid.semantic_search_communities(query=query, top_k=top_k)
 
 
 def _main() -> None:

@@ -24,6 +24,7 @@ import pyarrow as pa
 from pypdf import PdfReader
 
 from memory_core import GatorMemoryCore, MemoryCoreError
+from hybrid_memory import HybridMemoryStore
 
 GATOR_ROOT = Path(__file__).resolve().parents[1]
 RESEARCH_ROOT = GATOR_ROOT / "research"
@@ -55,6 +56,7 @@ class ScholarSense:
         db_path = Path(shared_db) if shared_db else (GATOR_ROOT / "db")
         self.mem = GatorMemoryCore(db_path=db_path, server_url=self.server_url)
         self.db = lancedb.connect(str(db_path))
+        self.hybrid = HybridMemoryStore(server_url=self.server_url)
 
     def _schema_for_dim(self, dim: int) -> pa.Schema:
         return pa.schema(
@@ -225,6 +227,14 @@ class ScholarSense:
             )
 
         table.add(rows)
+        for row in rows:
+            self.hybrid.register_chunk_metadata(
+                lance_id=str(row["id"]),
+                source_path=str(row["source_path"]),
+                node_ids=[str(x) for x in (row.get("node_ids") or [])],
+                text=str(row.get("text") or ""),
+                created_at=float(row.get("created_at") or time.time()),
+            )
 
         result = {
             "pdf": str(pdf_path),
@@ -234,6 +244,7 @@ class ScholarSense:
             "graphify": graph_info,
             "assigned_node_ids": len(default_nodes),
             "table": TABLE_NAME,
+            "hybrid_sql": self.hybrid.audit_counts(),
         }
         if progress_callback:
             progress_callback("complete", 100, result)

@@ -21,6 +21,8 @@ import uvicorn
 
 from event_bus import EventBusClient, EventBusError
 from memory_core import GatorMemoryCore
+from core.native_tools import NativeToolchain, NativeToolsError
+from maintenance import GatorMaintenance
 
 GATOR_ROOT = Path(__file__).resolve().parents[1]
 GATE_PATH = GATOR_ROOT / "bin" / "logic_map.gate"
@@ -112,6 +114,9 @@ class GatorBridge:
         # Dynamic identity: clone name set by GATOR_NODE_NAME env; falls back to prime.
         raw_node_name = os.environ.get("GATOR_NODE_NAME", "").strip()
         self.entity_name: str = raw_node_name if raw_node_name else "Gator-Prime"
+        self.node_role: str = str(os.environ.get("GATOR_ROLE", "prime") or "prime").strip().lower()
+        self.tools = NativeToolchain(root=GATOR_ROOT)
+        self.maintenance = GatorMaintenance(root=GATOR_ROOT)
 
     def _emit_debug(self, payload: dict[str, Any]) -> None:
         # Single-line stage markers required by clean-log policy.
@@ -163,6 +168,12 @@ class GatorBridge:
     def _remember_turn(self, user_prompt: str, assistant_text: str) -> None:
         self.chat_memory.append({"role": "user", "text": user_prompt.strip()})
         self.chat_memory.append({"role": "assistant", "text": assistant_text.strip()})
+
+    def _touch_activity(self) -> None:
+        try:
+            self.maintenance.touch_activity()
+        except Exception:
+            pass
 
     def _get_memory_core(self) -> GatorMemoryCore:
         if self._memory_core is None:
@@ -317,6 +328,7 @@ class GatorBridge:
             )
             self._stage_egress(generated, request_id=request_id)
             self._remember_turn(prompt, generated)
+            self._touch_activity()
 
             final_packet = {
                 "type": "generation_final",
@@ -355,6 +367,33 @@ class GatorBridge:
         result["scratchpad_rows_flushed"] = flushed_rows
         return result
 
+    def execute_native_tool(self, *, tool: str, args: dict[str, Any], issued_by: str = "") -> dict[str, Any]:
+        # Prime can invoke directly; worker clones only execute commands explicitly delegated by Prime.
+        if self.node_role != "prime":
+            if issued_by.strip().lower() not in {"gator-prime", "prime", "gator prime"}:
+                raise BridgeError("Slave node requires Prime delegation for tool execution")
+        try:
+            result = self.tools.execute(tool=tool, args=args)
+        except NativeToolsError as exc:
+            raise BridgeError(str(exc)) from exc
+
+        try:
+            self.bus.publish(
+                {
+                    "type": "tool_call",
+                    "tool": tool,
+                    "issued_by": issued_by or self.entity_name,
+                    "node": self.entity_name,
+                    "node_role": self.node_role,
+                    "ok": bool(result.get("ok", False)),
+                    "final": True,
+                }
+            )
+        except Exception:
+            pass
+        self._touch_activity()
+        return result
+
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -364,6 +403,12 @@ class GenerateRequest(BaseModel):
     top_p: float = 0.9
     min_p: float = 0.05
     request_id: str | None = None
+
+
+class ToolRequest(BaseModel):
+    tool: str
+    args: dict[str, Any] = {}
+    issued_by: str = ""
 
 
 def build_api(bridge: GatorBridge) -> FastAPI:
@@ -397,6 +442,39 @@ def build_api(bridge: GatorBridge) -> FastAPI:
     @app.post("/api/session_reset")
     def api_session_reset() -> dict[str, Any]:
         return bridge.session_reset()
+
+    @app.get("/api/tools")
+    def api_tools() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "node": bridge.entity_name,
+            "node_role": bridge.node_role,
+            "tools": [
+                {
+                    "name": "file_read",
+                    "description": "Read file content from locked /Gator workspace",
+                },
+                {
+                    "name": "file_write",
+                    "description": "Write or append file content within locked /Gator workspace",
+                },
+                {
+                    "name": "file_edit",
+                    "description": "Find/replace edit within locked /Gator workspace",
+                },
+                {
+                    "name": "web_sensor",
+                    "description": "Camoufox-only web snapshot (markdown or a11y), thinned for donor context",
+                },
+            ],
+        }
+
+    @app.post("/api/tools/execute")
+    def api_tools_execute(req: ToolRequest) -> dict[str, Any]:
+        try:
+            return bridge.execute_native_tool(tool=req.tool, args=req.args, issued_by=req.issued_by)
+        except BridgeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
 

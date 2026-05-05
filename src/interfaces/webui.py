@@ -21,7 +21,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dotenv import dotenv_values, load_dotenv, set_key
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
@@ -31,6 +31,7 @@ from scholar_sense import ScholarSense
 from discovery.cluster_namer import ClusterNamer, ClusterNamerError
 from core.mitosis import MitosisEngine
 from decommission_node import decommission_clone
+from agentic_cron import cron_start, cron_status, cron_stop
 
 GATOR_ROOT = Path(__file__).resolve().parents[2]
 GRAPH_HTML = GATOR_ROOT / "research" / "graphify-out" / "graph.html"
@@ -250,7 +251,41 @@ def api_refresh_graph() -> dict[str, Any]:
         "color": colors.get(cid, "#4E79A7"),
       }
     )
-  return {"ok": True, "nodes": nodes, "edges": edges, "legend": legend, "community_labels": labels}
+  return {
+    "ok": True,
+    "nodes": nodes,
+    "edges": edges,
+    "legend": legend,
+    "community_labels": labels,
+    "hybrid_sql": CLUSTER_NAMER.hybrid.audit_counts(),
+  }
+
+
+@app.get("/api/graph/semantic_search")
+def api_graph_semantic_search(q: str = Query(default="", min_length=1), top_k: int = 5) -> dict[str, Any]:
+  try:
+    hits = CLUSTER_NAMER.semantic_lookup(query=q, top_k=max(1, min(int(top_k), 20)))
+  except Exception as exc:
+    raise HTTPException(status_code=500, detail=f"semantic search failed: {exc}") from exc
+
+  graph_payload = {}
+  try:
+    graph_payload = json.loads(GRAPH_JSON.read_text(encoding="utf-8", errors="replace"))
+  except Exception:
+    graph_payload = {"nodes": []}
+
+  nodes = graph_payload.get("nodes", []) if isinstance(graph_payload, dict) else []
+  related: dict[int, list[dict[str, Any]]] = {}
+  for hit in hits:
+    cid = int(hit.get("community_id", -1))
+    related[cid] = [node for node in nodes if int(node.get("community", -1) or -1) == cid][:12]
+
+  return {
+    "ok": True,
+    "query": q,
+    "hits": hits,
+    "related_nodes": related,
+  }
 
 
 @app.get("/api/health")
@@ -386,6 +421,21 @@ def api_hive_decommission(payload: dict[str, Any]) -> dict[str, Any]:
     raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/api/cron/status")
+def api_cron_status() -> dict[str, Any]:
+  return {"ok": True, **cron_status()}
+
+
+@app.post("/api/cron/start")
+def api_cron_start() -> dict[str, Any]:
+  return {"ok": True, **cron_start()}
+
+
+@app.post("/api/cron/stop")
+def api_cron_stop() -> dict[str, Any]:
+  return {"ok": True, **cron_stop()}
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     graph_url = "/graph" if GRAPH_HTML.exists() else ""
@@ -422,6 +472,16 @@ def index() -> str:
       <h2>Live TPS, PID health, canary graft state, VRAM <span id="tgStatusInline" class="pill">Telegram: 🔴</span></h2>
       <div id=\"pills\" class=\"row\"></div>
       <div class="row" style="margin:8px 0">
+    <section class="card">
+      <h1>Agentic Cron</h1>
+      <h2>Dreaming / maintenance runner with hard off switch</h2>
+      <div class="row" style="margin:8px 0">
+        <button id="cronOnBtn" style="background:#1b6b3a">Cron ON</button>
+        <button id="cronOffBtn" style="background:#8b1f2a">Cron OFF</button>
+        <span id="cronBadge" class="pill">Cron: OFF</span>
+      </div>
+      <pre id="cronStatus">Loading cron status...</pre>
+    </section>
         <button id="interruptBtn">Interrupt</button>
         <button id="setupTelegramBtn">⚙️ Setup Telegram</button>
           <button id="mitosisBtn">[M] MITOSIS</button>
@@ -599,6 +659,28 @@ def index() -> str:
       const d = await r.json();
       document.getElementById('debug').textContent = JSON.stringify(d, null, 2);
     }}
+    async function refreshCronStatus() {{
+      try {{
+        const r = await fetch('/api/cron/status');
+        if (!r.ok) {{
+          throw new Error(`cron http ${{r.status}}`);
+        }}
+        const d = await r.json();
+        const badge = document.getElementById('cronBadge');
+        const enabled = !!d.enabled && !!d.alive;
+        badge.textContent = enabled ? `Cron: ON [pid=${{d.pid || 'n/a'}}]` : 'Cron: OFF';
+        document.getElementById('cronStatus').textContent = JSON.stringify(d, null, 2);
+      }} catch (err) {{
+        document.getElementById('cronStatus').textContent = `Cron refresh error: ${{String(err)}}`;
+      }}
+    }}
+    async function setCronEnabled(enabled) {{
+      const endpoint = enabled ? '/api/cron/start' : '/api/cron/stop';
+      const r = await fetch(endpoint, {{ method: 'POST' }});
+      const d = await r.json();
+      document.getElementById('cronStatus').textContent = JSON.stringify(d, null, 2);
+      await refreshCronStatus();
+    }}
     let lastGraphRefreshTs = 0;
     function reloadGraphFrame() {{
       const frame = document.getElementById('graphFrame');
@@ -693,6 +775,7 @@ def index() -> str:
     refreshDebug();
     refreshIngestStatus();
     refreshHiveStatus();
+    refreshCronStatus();
     document.getElementById('interruptBtn').addEventListener('click', async () => {{
       const r = await fetch('/api/interrupt', {{ method: 'POST' }});
       const d = await r.json();
@@ -724,6 +807,12 @@ def index() -> str:
     document.getElementById('cloneSpawnBtn').addEventListener('click', async () => {{
       await spawnClone();
     }});
+    document.getElementById('cronOnBtn').addEventListener('click', async () => {{
+      await setCronEnabled(true);
+    }});
+    document.getElementById('cronOffBtn').addEventListener('click', async () => {{
+      await setCronEnabled(false);
+    }});
     document.getElementById('ingestBtn').addEventListener('click', async () => {{
       const pdfPath = document.getElementById('pdfPath').value.trim();
       const r = await fetch('/api/ingest_pdf', {{
@@ -739,6 +828,7 @@ def index() -> str:
     setInterval(refreshDebug, 9000);
     setInterval(refreshIngestStatus, 1500);
     setInterval(refreshHiveStatus, 2500);
+    setInterval(refreshCronStatus, 2500);
     document.getElementById('decommissionBtn').addEventListener('click', () => {{
       const cloneName = document.getElementById('cloneSelect').value;
       if (!cloneName) {{

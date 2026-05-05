@@ -133,14 +133,9 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 
-# Action 3: launch hive telegram gateway (single bot instance; supports direct + multi-agent clone routing)
-nohup env GATOR_DEBUG="$GATOR_DEBUG" "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/interfaces/telegram_hive.py" \
-    >"$HIVE_LOG" 2>&1 &
-HIVE_PID=$!
-echo "$HIVE_PID" > "$HIVE_PID_FILE"
-# Write the same PID to legacy gateway PID file so webui monitoring stays consistent
-echo "$HIVE_PID" > "$TG_PID_FILE"
-TG_PID=$HIVE_PID
+# Action 3: Telegram gateway is user-initiated via "Setup Telegram" button in UI
+# Do NOT auto-launch telegram_hive.py — credentials must be configured first via the web UI
+# When user saves Telegram config, _restart_telegram_gateway() in webui.py will launch the process
 
 # Action 5: resume any hibernating clones registered in hive state
 "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/core/mitosis.py" --resume-hibernating >/dev/null 2>&1 || true
@@ -148,7 +143,7 @@ TG_PID=$HIVE_PID
 echo "GATOR IS AWAKE. VRAM CONSTRAINTS NOMINAL. LOGIC GRAFT ACTIVE."
 echo "gator-bridge pid: $BRIDGE_PID"
 echo "webui pid: $WEBUI_PID"
-echo "telegram-hive pid: $HIVE_PID (gateway superseded)"
+echo "telegram-hive: (user-initiated via UI Setup button)"
 echo "event-bus pid: $EVENT_BUS_PID"
 echo "kernel: $KERN_SO"
 echo "debug: GATOR_DEBUG=$GATOR_DEBUG"
