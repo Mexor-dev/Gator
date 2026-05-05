@@ -19,6 +19,19 @@ GATOR_DEBUG="${GATOR_DEBUG:-false}"
 GATOR_DAEMON="${GATOR_DAEMON:-false}"
 VERIFIED_SPECS="$GATOR_ROOT/config/hive_verified_specs.json"
 
+wait_http() {
+    local url="$1"
+    local attempts="$2"
+    local delay="$3"
+    for _ in $(seq 1 "$attempts"); do
+        if curl -sSf "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep "$delay"
+    done
+    return 1
+}
+
 mkdir -p "$GATOR_ROOT/logs" "$PID_DIR"
 mkdir -p "$GATOR_ROOT/config"
 if [[ -f "$VERIFIED_SPECS" ]]; then
@@ -118,6 +131,12 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 
+if ! wait_http "http://127.0.0.1:8090/health" 1 0; then
+    echo "[FATAL] bridge health check failed at http://127.0.0.1:8090/health"
+    tail -n 80 "$BRIDGE_LOG" || true
+    exit 1
+fi
+
 # Action 2: launch web UI on localhost:8080
 nohup env GATOR_DEBUG="$GATOR_DEBUG" "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/interfaces/webui.py" \
     --host "127.0.0.1" \
@@ -132,6 +151,16 @@ for _ in $(seq 1 60); do
     fi
     sleep 1
 done
+
+if ! wait_http "http://127.0.0.1:8080/api/health" 1 0; then
+    echo "[FATAL] webui health check failed at http://127.0.0.1:8080/api/health"
+    echo "[FATAL] webui pid file: $WEBUI_PID_FILE"
+    if [[ -f "$WEBUI_PID_FILE" ]]; then
+        echo "[FATAL] webui pid: $(cat "$WEBUI_PID_FILE" 2>/dev/null || true)"
+    fi
+    tail -n 120 "$WEBUI_LOG" || true
+    exit 1
+fi
 
 # Action 3: Telegram gateway is user-initiated via "Setup Telegram" button in UI
 # Do NOT auto-launch telegram_hive.py — credentials must be configured first via the web UI
