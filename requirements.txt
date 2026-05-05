@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-dotenv
+lancedb
+llama-cpp-python
+numpy
+pyarrow
+pandas
+pypdf
+reportlab
+python-telegram-bot
+dnspython
