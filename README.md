@@ -1,4 +1,4 @@
-#<img width="759" height="768" alt="1778013647203" src="https://github.com/user-attachments/assets/22d0425d-7deb-43f0-b3a0-3efec37caeb6" />
+<img width="759" height="768" alt="1778013647203" src="https://github.com/user-attachments/assets/22d0425d-7deb-43f0-b3a0-3efec37caeb6" />
 
 
 **A self-contained, locally-hosted AI substrate.** Gator runs a 35B-class logic
