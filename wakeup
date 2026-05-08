@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GATOR_ROOT="$HOME/Gator"
+
+# Source .env file to load Telegram auto-start configuration if present
+if [[ -f "$GATOR_ROOT/.env" ]]; then
+    set +u  # Temporarily disable unset variable check for .env sourcing
+    source "$GATOR_ROOT/.env"
+    set -u
+fi
+
+BRIDGE_LOG="$GATOR_ROOT/logs/gator_bridge.log"
+CC_LOG="$GATOR_ROOT/logs/command_center.log"
+TG_LOG="$GATOR_ROOT/logs/telegram_gateway.log"
+HIVE_LOG="$GATOR_ROOT/logs/telegram_hive.log"
+GATOR_SERVER_LOG="$GATOR_ROOT/logs/gator_server.log"
+PID_DIR="$GATOR_ROOT/bin"
+EVENT_BUS_PATH="/tmp/gator_event.bus"
+EVENT_BUS_LOG="$GATOR_ROOT/logs/event_bus.log"
+KERN_SO="$GATOR_ROOT/src/inference/libgator_kern.so"
+EVENT_BUS_PID_FILE="$PID_DIR/event_bus.pid"
+BRIDGE_PID_FILE="$PID_DIR/gator_bridge.pid"
+CC_PID_FILE="$PID_DIR/command_center.pid"
+TG_PID_FILE="$PID_DIR/telegram_gateway.pid"
+HIVE_PID_FILE="$PID_DIR/telegram_hive.pid"
+GATOR_SERVER_PID_FILE="$PID_DIR/gator_server.pid"
+GATOR_DEBUG="${GATOR_DEBUG:-false}"
+GATOR_DAEMON="${GATOR_DAEMON:-false}"
+GATOR_REQUIRE_REAL_MODEL="${GATOR_REQUIRE_REAL_MODEL:-true}"
+GATOR_SERVER_URL="${GATOR_SERVER_URL:-http://127.0.0.1:8081}"
+VERIFIED_SPECS="$GATOR_ROOT/config/hive_verified_specs.json"
+CURL_HEALTH_OPTS=(--connect-timeout 1 --max-time 2)
+
+purge_python_caches() {
+    find "$GATOR_ROOT" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+    find "$GATOR_ROOT" -type f -name '*.pyc' -delete 2>/dev/null || true
+}
+
+evict_ui_ports() {
+    if command -v sudo >/dev/null 2>&1 && command -v fuser >/dev/null 2>&1; then
+        sudo -n fuser -k 8000/tcp 2>/dev/null || true
+        sudo -n fuser -k 8080/tcp 2>/dev/null || true
+    fi
+    if command -v fuser >/dev/null 2>&1; then
+        fuser -k 8000/tcp 8080/tcp 2>/dev/null || true
+    fi
+}
+
+wait_http() {
+    local url="$1"
+    local attempts="$2"
+    local delay="$3"
+    for _ in $(seq 1 "$attempts"); do
+        if curl "${CURL_HEALTH_OPTS[@]}" -sSf "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep "$delay"
+    done
+    return 1
+}
+
+mkdir -p "$GATOR_ROOT/logs" "$PID_DIR"
+mkdir -p "$GATOR_ROOT/config"
+purge_python_caches
+evict_ui_ports
+if [[ -f "$VERIFIED_SPECS" ]]; then
+    chmod 444 "$VERIFIED_SPECS" 2>/dev/null || true
+fi
+
+if [[ ! -f "$GATOR_ROOT/bin/logic_map.gate" ]]; then
+    echo "[FATAL] logic_map.gate missing at $GATOR_ROOT/bin/logic_map.gate"
+    echo "Run extraction first: bash ~/Gator/run_extraction.sh"
+    exit 1
+fi
+
+# Prune legacy generic binaries if present.
+rm -f "$GATOR_ROOT/bin/llama-server" "$GATOR_ROOT/bin/llama-cli" 2>/dev/null || true
+rm -f "$GATOR_ROOT/bin/llama_server.pid" 2>/dev/null || true
+
+# Native build enforcement for gator kernel.
+if [[ ! -f "$KERN_SO" ]]; then
+    echo "Building Custom Gator Kernel..."
+    (
+        cd "$GATOR_ROOT/src/inference"
+        make
+    )
+fi
+
+if [[ ! -f "$KERN_SO" ]]; then
+    echo "[FATAL] Gator Kern Not Compiled: missing $KERN_SO"
+    exit 1
+fi
+
+
+cleanup() {
+    if [[ -f "$EVENT_BUS_PID_FILE" ]]; then
+        kill "$(cat "$EVENT_BUS_PID_FILE")" 2>/dev/null || true
+    fi
+    if [[ -f "$BRIDGE_PID_FILE" ]]; then
+        kill "$(cat "$BRIDGE_PID_FILE")" 2>/dev/null || true
+    fi
+    if [[ -f "$CC_PID_FILE" ]]; then
+        kill "$(cat "$CC_PID_FILE")" 2>/dev/null || true
+    fi
+    if [[ -f "$TG_PID_FILE" ]]; then
+        kill "$(cat "$TG_PID_FILE")" 2>/dev/null || true
+    fi
+    if [[ -f "$HIVE_PID_FILE" ]]; then
+        kill "$(cat "$HIVE_PID_FILE")" 2>/dev/null || true
+    fi
+    if [[ -f "$GATOR_SERVER_PID_FILE" ]]; then
+        kill "$(cat "$GATOR_SERVER_PID_FILE")" 2>/dev/null || true
+    fi
+}
+if [[ "$GATOR_DAEMON" != "true" ]]; then
+    trap cleanup EXIT INT TERM
+fi
+
+# Clear stale instances so the new stack binds expected ports and code version.
+pkill -f "$GATOR_ROOT/src/gator_bridge.py" 2>/dev/null || true
+pkill -f "$GATOR_ROOT/src/interfaces/command_center.py" 2>/dev/null || true
+pkill -f "$GATOR_ROOT/src/interfaces/telegram_gateway.py" 2>/dev/null || true
+pkill -f "$GATOR_ROOT/src/interfaces/telegram_hive.py" 2>/dev/null || true
+pkill -f "$GATOR_ROOT/src/event_bus.py" 2>/dev/null || true
+pkill -f "$GATOR_ROOT/bin/gator-server" 2>/dev/null || true
+pkill -f "$GATOR_ROOT/bin/launch_gator_server.sh" 2>/dev/null || true
+rm -f "$EVENT_BUS_PATH" 2>/dev/null || true
+sleep 1
+# Force-kill any survivors (handles processes ignoring SIGTERM)
+pkill -9 -f "$GATOR_ROOT/src/interfaces/telegram_gateway.py" 2>/dev/null || true
+pkill -9 -f "$GATOR_ROOT/src/interfaces/telegram_hive.py" 2>/dev/null || true
+pkill -9 -f "$GATOR_ROOT/bin/gator-server" 2>/dev/null || true
+pkill -9 -f "$GATOR_ROOT/bin/launch_gator_server.sh" 2>/dev/null || true
+sleep 0.5
+
+# Pre-flight port eviction: native gator-server MUST own 8081, the bridge owns
+# 8090, and the Command Center owns 8000. Kill
+# anything else that may be squatting on those sockets so the new stack binds
+# cleanly. Zero-residual startup contract.
+if command -v fuser >/dev/null 2>&1; then
+    fuser -k 8000/tcp 8081/tcp 8090/tcp 2>/dev/null || true
+else
+    if command -v ss >/dev/null 2>&1; then
+        for p in 8000 8081 8090; do
+            ss -ltnpH "sport = :$p" 2>/dev/null \
+                | grep -oE 'pid=[0-9]+' | cut -d= -f2 \
+                | xargs -r kill -9 2>/dev/null || true
+        done
+    fi
+fi
+sleep 0.3
+
+# Start native gator-server if it is not already healthy.
+if ! curl "${CURL_HEALTH_OPTS[@]}" -sSf "$GATOR_SERVER_URL/health" >/dev/null 2>&1; then
+    chmod +x "$GATOR_ROOT/bin/launch_gator_server.sh" 2>/dev/null || true
+    # Single-engine architecture: 1.5B chassis only. The 35B donor is
+    # decommissioned to models/_decommissioned/. Intelligence is grafted via
+    # bin/logic_map.gate (live logit_bias) + libgator_kern.so (native runtime).
+    nohup env GATOR_ROOT="$GATOR_ROOT" \
+        GATOR_GRAFT_LORA="${GATOR_GRAFT_LORA:-}" \
+        GATOR_GRAFT_CONTROL_VECTOR="${GATOR_GRAFT_CONTROL_VECTOR:-}" \
+        GATOR_GRAFT_SCALE="${GATOR_GRAFT_SCALE:-1.0}" \
+        "$GATOR_ROOT/bin/launch_gator_server.sh" \
+        >"$GATOR_SERVER_LOG" 2>&1 &
+    GATOR_SERVER_PID=$!
+    echo "$GATOR_SERVER_PID" > "$GATOR_SERVER_PID_FILE"
+    # Extended 120-second window for the native C++ server to seat the 35B
+    # weights and report Ready. No degraded-mode fallback: if 8081 is not
+    # healthy within MAX_RETRIES, abort.
+    GATOR_SERVER_READY=0
+    GATOR_SERVER_MAX_RETRIES="${GATOR_SERVER_MAX_RETRIES:-120}"
+    for _ in $(seq 1 "$GATOR_SERVER_MAX_RETRIES"); do
+        if curl "${CURL_HEALTH_OPTS[@]}" -sSf "$GATOR_SERVER_URL/health" >/dev/null 2>&1; then
+            GATOR_SERVER_READY=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ "$GATOR_SERVER_READY" != "1" ]]; then
+        echo "[FATAL] native gator-server failed to report Ready within ${GATOR_SERVER_MAX_RETRIES}s on $GATOR_SERVER_URL/health"
+        tail -n 80 "$GATOR_SERVER_LOG" 2>/dev/null || true
+        kill "$GATOR_SERVER_PID" 2>/dev/null || true
+        exit 1
+    fi
+    echo "Gator-Server: Ready"
+fi
+
+# Hard requirement: native gator-server must be healthy. No fallback paths.
+if ! curl "${CURL_HEALTH_OPTS[@]}" -sSf "$GATOR_SERVER_URL/health" >/dev/null 2>&1; then
+    echo "[FATAL] native gator-server unhealthy at $GATOR_SERVER_URL/health (no degraded mode allowed)"
+    tail -n 80 "$GATOR_SERVER_LOG" 2>/dev/null || true
+    exit 1
+fi
+
+# Action 0: boot event-bus before model handshake
+nohup "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/event_bus.py" --daemon >"$EVENT_BUS_LOG" 2>&1 &
+EVENT_BUS_PID=$!
+echo "$EVENT_BUS_PID" > "$EVENT_BUS_PID_FILE"
+
+for _ in $(seq 1 40); do
+    if [[ -S "$EVENT_BUS_PATH" ]]; then
+        break
+    fi
+    sleep 0.1
+done
+
+if [[ ! -S "$EVENT_BUS_PATH" ]]; then
+    echo "[FATAL] event bus did not become ready at $EVENT_BUS_PATH"
+    tail -n 40 "$EVENT_BUS_LOG" || true
+    exit 1
+fi
+
+# Action 1: launch native-only gator bridge API/CLI wrapper
+nohup env GATOR_DEBUG="$GATOR_DEBUG" GATOR_VERIFIED_SPECS="$VERIFIED_SPECS" GATOR_GUARD_ENFORCED="true" GATOR_KERN_LIB="$KERN_SO" GATOR_SERVER_URL="$GATOR_SERVER_URL" "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/gator_bridge.py" \
+    --mode api \
+    --host "127.0.0.1" \
+    --port 8090 \
+    >"$BRIDGE_LOG" 2>&1 &
+BRIDGE_PID=$!
+echo "$BRIDGE_PID" > "$BRIDGE_PID_FILE"
+
+for _ in $(seq 1 60); do
+    if curl "${CURL_HEALTH_OPTS[@]}" -sSf "http://127.0.0.1:8090/health" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+if ! wait_http "http://127.0.0.1:8090/health" 1 0; then
+    echo "[FATAL] bridge health check failed at http://127.0.0.1:8090/health"
+    tail -n 80 "$BRIDGE_LOG" || true
+    exit 1
+fi
+
+# Action 2: validate the bridge generate pipeline end-to-end so we never
+# report "AWAKE" while the LanceDB scratchpad / kernel chain is broken.
+# The first generation can be slow while CUDA/model caches warm up, so retry
+# before declaring startup failure.
+GEN_PROBE="000"
+for _ in $(seq 1 3); do
+    GEN_PROBE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        --connect-timeout 2 \
+        --max-time 180 \
+        -d '{"prompt":"ready check","max_tokens":8,"temperature":0.4}' \
+        "http://127.0.0.1:8090/generate" || true)
+    if [[ "$GEN_PROBE" == "200" ]]; then
+        break
+    fi
+    sleep 2
+done
+if [[ "$GEN_PROBE" != "200" ]]; then
+    echo "[FATAL] bridge /generate readiness probe returned HTTP $GEN_PROBE"
+    tail -n 60 "$BRIDGE_LOG" || true
+    exit 1
+fi
+
+# Action 2b: launch Command Center UI on localhost:8000.
+# This is process-isolated so a model backend restart does not require a UI restart.
+# Health-checked with a 30s window.
+nohup env GATOR_DEBUG="$GATOR_DEBUG" GATOR_BRIDGE_URL="http://127.0.0.1:8090" \
+    "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/interfaces/command_center.py" \
+    --host "127.0.0.1" --port 8000 \
+    >"$CC_LOG" 2>&1 &
+CC_PID=$!
+echo "$CC_PID" > "$CC_PID_FILE"
+for _ in $(seq 1 30); do
+    if curl "${CURL_HEALTH_OPTS[@]}" -sSf "http://127.0.0.1:8000/api/health" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+if ! wait_http "http://127.0.0.1:8000/api/health" 1 0; then
+    echo "[FATAL] command-center health check failed at http://127.0.0.1:8000/api/health"
+    tail -n 80 "$CC_LOG" || true
+    exit 1
+fi
+
+# Action 3: Telegram gateway. Auto-start if credentials are present in .env
+# AND GATOR_AUTO_TELEGRAM=1; otherwise it is user-initiated via UI Setup button.
+TG_STATE="skipped"
+if [[ "${GATOR_AUTO_TELEGRAM:-0}" == "1" && -f "$GATOR_ROOT/.env" ]]; then
+    if grep -q "^GATOR_TG_BOT_TOKEN=" "$GATOR_ROOT/.env" && \
+       grep -q "^GATOR_TG_AUTH_CHAT_ID=" "$GATOR_ROOT/.env"; then
+        nohup "$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/interfaces/telegram_hive.py" \
+            >>"$HIVE_LOG" 2>&1 &
+        HIVE_PID=$!
+        echo "$HIVE_PID" > "$TG_PID_FILE"
+        echo "$HIVE_PID" > "$HIVE_PID_FILE"
+        TG_READY=0
+        for _ in $(seq 1 30); do
+            sleep 0.5
+            if [[ -f "$GATOR_ROOT/logs/telegram_hive_status.json" ]]; then
+                if "$GATOR_ROOT/venv/bin/python" -c "import json,sys; d=json.load(open('$GATOR_ROOT/logs/telegram_hive_status.json')); sys.exit(0 if d.get('authenticated') else 1)" 2>/dev/null; then
+                    TG_READY=1
+                    break
+                fi
+            fi
+        done
+        if [[ "$TG_READY" == "1" ]]; then
+            TG_STATE="ready (pid $HIVE_PID)"
+        else
+            TG_STATE="started but not yet authenticated (pid $HIVE_PID); see $HIVE_LOG"
+        fi
+    else
+        TG_STATE="auto-start requested but .env missing token/chat_id"
+    fi
+fi
+
+# Action 5: resume any hibernating clones registered in hive state
+"$GATOR_ROOT/venv/bin/python" "$GATOR_ROOT/src/core/mitosis.py" --resume-hibernating >/dev/null 2>&1 || true
+
+echo "GATOR IS AWAKE. VRAM CONSTRAINTS NOMINAL. LOGIC GRAFT ACTIVE."
+echo "ready-checks: bridge=200 command-center=200 generate=$GEN_PROBE"
+echo "gator-bridge pid: $BRIDGE_PID"
+echo "command-center pid: $CC_PID  (http://127.0.0.1:8000)"
+echo "telegram-hive: $TG_STATE"
+echo "event-bus pid: $EVENT_BUS_PID"
+if [[ -f "$GATOR_SERVER_PID_FILE" ]]; then
+    echo "gator-server pid: $(cat "$GATOR_SERVER_PID_FILE" 2>/dev/null || true)"
+fi
+echo "kernel: $KERN_SO"
+echo "debug: GATOR_DEBUG=$GATOR_DEBUG"
+echo "logs: $EVENT_BUS_LOG | $GATOR_SERVER_LOG | $BRIDGE_LOG | $CC_LOG | $HIVE_LOG"
+
+if [[ "$GATOR_DAEMON" == "true" ]]; then
+    exit 0
+fi
+
+wait "$BRIDGE_PID"

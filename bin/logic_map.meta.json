@@ -1,0 +1,15 @@
+{
+  "extracted_at": 1778151309,
+  "donor": "/home/user/Gator/models/_decommissioned/donor.gguf.bak",
+  "n_prompts": 708,
+  "n_records": 3672,
+  "n_failures": 541,
+  "elapsed_s": 5089,
+  "tokens_per_prompt": 22,
+  "ctx_window_hash_chars": 256,
+  "categories": {
+    "1": "technical_triage",
+    "2": "project_context",
+    "3": "agentic_reasoning"
+  }
+}

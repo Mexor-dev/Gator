@@ -1,0 +1,17 @@
+# Iron-Gator pinned dependency set (May 2026 validated build)
+# Versions match the successful sub-zero-paradox validation pass.
+fastapi==0.136.1
+uvicorn==0.46.0
+httpx==0.28.1
+requests==2.33.1
+numpy==2.4.4
+llama-cpp-python==0.3.21
+aiohttp==3.13.2
+python-dotenv
+lancedb
+pyarrow
+pandas
+pypdf
+reportlab
+python-telegram-bot
+dnspython
